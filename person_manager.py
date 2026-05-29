@@ -75,7 +75,7 @@ _MAX_KIN_DIST_RELAXED = 1.50   # uvolněný limit při LOST / full-frame fallbac
 # mot_sim – tvrdý práh na pohyb (1-sim_score musí být >= prahu, jinak = FAIL)
 # crop: benevolentní – osoba stojí na místě je OK
 # full_frame: přísnější – ve full-frame chceme vidět pohyb
-_MOTION_HARD_THR_CROP     = 0.10   # min (1-sim) pro crop pipeline
+_MOTION_HARD_THR_CROP     = 0.29   # min (1-sim) pro crop pipeline  [= 1 - threshold_static(0.71)]
 _MOTION_HARD_THR_FULL     = 0.40   # min (1-sim) pro full-frame pipeline
 
 # final_conf – vážená kombinace
@@ -336,6 +336,7 @@ class PersonManager:
         timestamp_ms: float,
         video_detector,    # PoseDetector (VIDEO mode) – P1 full-frame
         image_detector,    # PoseDetectorImage (IMAGE mode) – crop + scan
+        prev_frame: np.ndarray | None = None,  # poslední přeskočený snímek před tímto
     ) -> tuple[list[dict], bool]:
 
         # Uložíme rozlišení framu pro pixel-správný čtvercový crop
@@ -346,7 +347,7 @@ class PersonManager:
 
         # ── Slot 0: Person 1 ──────────────────────────────────────────────
         r0, lost_transition = self._update_slot0(
-            frame, timestamp_ms, video_detector, image_detector, scan_all
+            frame, timestamp_ms, video_detector, image_detector, scan_all, prev_frame
         )
 
         # ── Slot 1: Person 2 ──────────────────────────────────────────────
@@ -378,6 +379,7 @@ class PersonManager:
         video_detector,
         image_detector,
         scan_all: list,
+        prev_frame: np.ndarray | None = None,
     ) -> tuple[dict, bool]:
         slot = self.slots[0]
 
@@ -392,6 +394,7 @@ class PersonManager:
             # GHOST: aktivní crop (posouvá se dle kinematické predikce)
             # LOST: frozen crop (tracker již nefunguje, hledáme v poslední známé oblasti)
             crop = slot.crop if slot.state != slot.LOST else slot.frozen_crop
+            detection_crop = crop   # crop použitý pro detekci v TOMTO snímku
 
             # 1. Pokus o crop detekci (IMAGE mode – stateless, přesný)
             # GHOST/LOST stav: uvolněný kinematický limit (osoba může skokem být daleko)
@@ -426,6 +429,7 @@ class PersonManager:
                 pipe_used    = "full_frame" if full_ok else "none"
 
         else:  # EMPTY
+            detection_crop = None   # žádný crop, detekce ve full-frame
             # VIDEO full-frame, nebo nejbližší ze scanu
             lm_video = video_detector.process_frame(frame, timestamp_ms)
             lm_full  = lm_video if lm_video is not None else self._nearest_to(scan_all, slot)
@@ -443,28 +447,42 @@ class PersonManager:
         result = self._score_and_decide(slot, frame, effective_lm, kin_score, pipe_used)
 
         # Hires fallback: pokud suspicious a máme aktivní crop, zkusíme znovu s vyšším rozlišením
+        # Preferujeme prev_frame (přeskočený snímek těsně před tímto) – bývá čistší
         if result.get("pose_suspicious") and slot.state in (slot.TRACKING, slot.GHOST, slot.LOST):
             hires_crop = slot.crop if slot.state != slot.LOST else slot.frozen_crop
-            lm_hires = self._detect_in_crop_hires(frame, hires_crop, image_detector)
+            hires_source_frame = prev_frame if prev_frame is not None else frame
+            hires_source_label = "prev_frame" if prev_frame is not None else "current_frame"
+            logger.info(
+                "Slot 0: snímek suspicious (pose_param=%.3f) – spouštím hires fallback (512×288) na %s",
+                result.get("pose_param", 0.0),
+                hires_source_label,
+            )
+            lm_hires = self._detect_in_crop_hires(hires_source_frame, hires_crop, image_detector)
             if lm_hires is not None:
                 is_relaxed_hires = slot.state in (slot.GHOST, slot.LOST)
                 hires_ok, lm_h, kin_h, _, _, _ = self._early_filter(
                     slot, lm_hires, relaxed_kin=is_relaxed_hires
                 )
                 if hires_ok:
+                    logger.info("Slot 0: hires fallback ÚSPĚŠNÝ – výsledek přepsán hires detekcí")
                     _restore_slot_validators(slot, _snap0)
                     result = self._score_and_decide(slot, frame, lm_h, kin_h, "crop_hires")
+                else:
+                    logger.debug("Slot 0: hires fallback selhal (early filter zamítl)")
+            else:
+                logger.debug("Slot 0: hires fallback – detekce vrátila None")
 
         # Přechod stavů
         lost_transition = self._apply_state(slot, result)
 
         r0 = {
             **result,
-            "slot_id":     0,
-            "state":       slot.state,
-            "crop":        slot.crop,
-            "frozen_crop": slot.frozen_crop,
-            "pipe_debug":  pipe_debug,
+            "slot_id":       0,
+            "state":         slot.state,
+            "crop":          slot.crop,
+            "frozen_crop":   slot.frozen_crop,
+            "detection_crop": detection_crop,
+            "pipe_debug":    pipe_debug,
             "kin_predicted": (float(slot.kin_predicted[0]), float(slot.kin_predicted[1])) if slot.kin_predicted is not None else None,
         }
         return r0, lost_transition
@@ -486,6 +504,7 @@ class PersonManager:
 
         # P2 je TRACKING, GHOST nebo LOST – detekce pouze v crop
         crop = slot.crop if slot.state != slot.LOST else slot.frozen_crop
+        detection_crop = crop   # crop použitý pro detekci v TOMTO snímku
         is_relaxed = slot.state in (slot.GHOST, slot.LOST)
         lm_crop = self._detect_in_crop(frame, crop, image_detector)
         full_ok, lm_v, kin_v, _, _, _ = self._early_filter(slot, lm_crop, relaxed_kin=is_relaxed)
@@ -499,6 +518,10 @@ class PersonManager:
         # Hires fallback (stejná logika jako u slot 0)
         if result.get("pose_suspicious") and slot.state in (slot.TRACKING, slot.GHOST, slot.LOST):
             hires_crop = slot.crop if slot.state != slot.LOST else slot.frozen_crop
+            logger.info(
+                "Slot 1: snímek suspicious (pose_param=%.3f) – spouštím hires fallback (512×288)",
+                result.get("pose_param", 0.0),
+            )
             lm_hires = self._detect_in_crop_hires(frame, hires_crop, image_detector)
             if lm_hires is not None:
                 is_relaxed_hires = slot.state in (slot.GHOST, slot.LOST)
@@ -506,17 +529,23 @@ class PersonManager:
                     slot, lm_hires, relaxed_kin=is_relaxed_hires
                 )
                 if hires_ok:
+                    logger.info("Slot 1: hires fallback ÚSPĚŠNÝ – výsledek přepsán hires detekcí")
                     _restore_slot_validators(slot, _snap1)
                     result = self._score_and_decide(slot, frame, lm_h, kin_h, "crop_hires")
+                else:
+                    logger.debug("Slot 1: hires fallback selhal (early filter zamítl)")
+            else:
+                logger.debug("Slot 1: hires fallback – detekce vrátila None")
 
         self._apply_state(slot, result)
 
         return {
             **result,
-            "slot_id":     1,
-            "state":       slot.state,
-            "crop":        slot.crop,
-            "frozen_crop": slot.frozen_crop,
+            "slot_id":        1,
+            "state":          slot.state,
+            "crop":           slot.crop,
+            "frozen_crop":    slot.frozen_crop,
+            "detection_crop": detection_crop,
             "kin_predicted": (float(slot.kin_predicted[0]), float(slot.kin_predicted[1])) if slot.kin_predicted is not None else None,
         }
 
@@ -582,7 +611,7 @@ class PersonManager:
 
         # Tvrdý motion práh (různý pro crop vs full-frame)
         if valid_pose:
-            motion_thr = _MOTION_HARD_THR_CROP if pipe_used == "crop" else _MOTION_HARD_THR_FULL
+            motion_thr = _MOTION_HARD_THR_CROP if pipe_used in ("crop", "crop_hires") else _MOTION_HARD_THR_FULL
             if (1.0 - sim_score) < motion_thr:
                 valid_pose   = False
                 effective_lm = None
@@ -599,6 +628,8 @@ class PersonManager:
         slot.scale_detector.update(effective_lm if valid_pose else None)
 
         # 6c. Detekce přeskoku na jinou osobu (scale switch)
+        # Scale switch neznamená okamžitý reset – jen zamítneme tuto detekci jako nevalidní.
+        # Historie (appearance, scale buffer) zůstává nedotčena pro příští snímek.
         scale_err    = slot.scale_detector.last_scale_err
         scale_switch = False
         if (
@@ -609,10 +640,11 @@ class PersonManager:
         ):
             scale_switch = True
             logger.info(
-                "Slot %d: scale switch detekován (scale_err=%.3f appear=%.3f)",
+                "Slot %d: scale switch detekován (scale_err=%.3f appear=%.3f) – detekce zamítnuta",
                 slot.slot_id, scale_err, appearance_score,
             )
-            slot.reset()   # shodíme slot – osoba X zmizela, toto je jiná osoba
+            valid_pose   = False
+            effective_lm = None
 
         # 7. PersonTracker (kinematika + temporální EMA)
         tracker_present, track_info = slot.tracker.update(
@@ -640,14 +672,28 @@ class PersonManager:
         else:
             slot.relaxed_count = max(slot.relaxed_count - 1, 0)
 
-        # 8. Váhovaná kombinace
+        # 8. Váhovaná kombinace – zahrnuje jen složky, které mají skutečná data.
+        # Složky s defaultní hodnotou 1.0 (kin, motion, appearance) se vynechají
+        # pokud ještě nemají historii, aby neuměle nafukaly final_conf.
+        #
+        # Hodnoty komponent jsou remapovány z [0.3, 1.0] → [0.0, 1.0] před vstupem
+        # do váhové kombinace – hodnoty pod 0.3 se zahodí jako 0.0, čímž se zvyšuje
+        # citlivost a snižuje počet falešně pozitivních detekcí.
+        def _remap(v: float) -> float:
+            return max(0.0, (v - 0.5) / 0.5)
+
         if valid_pose:
-            final_conf = (
-                _W_TRACKER    * presence_prob
-                + _W_KIN      * kin_score
-                + _W_MOTION   * (1.0 - sim_score)
-                + _W_APPEARANCE * appearance_score
-            )
+            components: list[tuple[float, float]] = [
+                (_W_TRACKER, _remap(presence_prob)),   # vždy relevantní
+            ]
+            if slot.kin_predicted is not None:
+                components.append((_W_KIN, _remap(kin_score)))
+            if slot.motion_validator.has_history:
+                components.append((_W_MOTION, _remap(1.0 - sim_score)))
+            if slot.appearance_validator.has_history:
+                components.append((_W_APPEARANCE, _remap(appearance_score)))
+            total_w    = sum(w for w, _ in components)
+            final_conf = sum(w * v for w, v in components) / total_w
         else:
             final_conf = 0.0
 

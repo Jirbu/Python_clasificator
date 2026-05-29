@@ -211,10 +211,39 @@ class Visualizer:
         # Globální panel (vpravo nahoře)
         self._draw_global_panel(vis, action, timestamp_ms, current_fps, p1)
 
+        # HIGH RES badge (levý dolní roh) – zobrazí se pokud byl použit hires fallback
+        if p1 is not None and p1.get("pipeline_used") == "crop_hires":
+            self._draw_hires_badge(vis)
+
         self._writer.write(vis)
 
     def release(self) -> None:
         self._writer.release()
+
+    def _draw_hires_badge(self, frame: np.ndarray) -> None:
+        """Nakreslí 'HIGH RES' badge v levém dolním rohu snímku."""
+        h, w = frame.shape[:2]
+        text = "HIGH RES"
+        scale = _FONT_MD
+        thick = 2
+        (tw, th), _ = cv2.getTextSize(text, _FONT, scale, thick)
+        pad = 8
+        margin = 10
+        x1 = margin
+        y2 = h - margin
+        x2 = x1 + tw + pad * 2
+        y1 = y2 - th - pad * 2
+        # Poloprůhledné pozadí
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.70, frame, 0.30, 0, frame)
+        # Rámeček + text (fialová barva)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (220, 60, 220), 1, cv2.LINE_AA)
+        cv2.putText(
+            frame, text,
+            (x1 + pad, y2 - pad),
+            _FONT, scale, (220, 60, 220), thick, cv2.LINE_AA,
+        )
 
     # ── Jump trajectory ────────────────────────────────────────────────────────
 
@@ -350,8 +379,17 @@ class Visualizer:
             else:
                 self._draw_skeleton_p2(frame, draw_lm)
 
+        # ── Detection crop (fialový) — oblast ve které probíhala detekce v TOMTO snímku ──
+        det_crop = result.get("detection_crop")
+        if det_crop is not None:
+            dc1, dy1, dc2, dy2 = det_crop
+            dx1 = max(0, int(dc1 * w)); ddy1 = max(0, int(dy1 * h))
+            dx2 = min(w, int(dc2 * w)); ddy2 = min(h, int(dy2 * h))
+            cv2.rectangle(frame, (dx1, ddy1), (dx2, ddy2), (200, 0, 200), 1, cv2.LINE_AA)
+
         # ── Crop bbox (pose + 40% margin) — žlutý/cyan plný obdélník ────
         # TRACKING/GHOST: aktivní crop; LOST: frozen crop
+        # (toto je crop vypočtený v TOMTO snímku, použitý pro detekci v PŘÍŠTÍM snímku)
         crop = result.get("crop") if state in ("TRACKING", "GHOST") else result.get("frozen_crop")
         bx1 = by1 = bx2 = by2 = None
         if crop is not None:

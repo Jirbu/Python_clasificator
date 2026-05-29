@@ -212,6 +212,11 @@ class AppearanceValidator:
 
         return float(np.clip(1.0 - final_error, 0.0, 1.0))
 
+    @property
+    def has_history(self) -> bool:
+        """True pokud alespoň jeden segment má dost dat v bufferu."""
+        return any(len(buf) >= self._min_buffer for buf in self._buffers.values())
+
     def reset(self) -> None:
         """Reset při přechodu na nové video."""
         for buf in self._buffers.values():

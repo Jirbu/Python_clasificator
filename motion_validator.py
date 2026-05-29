@@ -325,6 +325,11 @@ class MotionValidator:
         # region_dynamic zůstává v debug_info pro zpracovatávat vizualizace.
         return similarity_score, debug_info
 
+    @property
+    def has_history(self) -> bool:
+        """True pokud buffer obsahuje dost snímků pro smysluplné porovnání."""
+        return len(self._frame_buffer) > self.compare_steps[0]
+
     def reset(self) -> None:
         """Reset při přechodu na nové video."""
         self._frame_buffer.clear()

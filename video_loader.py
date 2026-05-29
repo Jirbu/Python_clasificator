@@ -66,13 +66,18 @@ class VideoLoader:
 
     def frame_generator(self):
         """
-        Generátor, který yieldi (timestamp_ms, frame) tuplu pro každý
+        Generátor, který yieldi (timestamp_ms, frame, prev_frame) tuplu pro každý
         analyzovaný snímek (tzn. po frame_step krocích).
+
+        prev_frame -- poslední přeskočený snímek těsně PŘED aktuálním zpracovaným
+                      snímkem (nebo None pro první snímek). Lze použít jako čistší
+                      alternativu k aktuálnímu snímku při hires fallbacku.
 
         Vypočítává timestamp z absolutního indexu snímku v původním videu,
         aby timestamp přesně odpovídal pozici v čase.
         """
         frame_index = 0
+        prev_frame = None
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # reset na začátek
 
         while True:
@@ -83,7 +88,10 @@ class VideoLoader:
             # Zpracuj pouze každý N-tý snímek
             if frame_index % self.frame_step == 0:
                 timestamp_ms = self.calculate_timestamp_ms(frame_index)
-                yield timestamp_ms, frame
+                yield timestamp_ms, frame, prev_frame
+                prev_frame = None  # reset – příští přeskočený snímek přepíše
+            else:
+                prev_frame = frame  # pamatuj si poslední přeskočený snímek
 
             frame_index += 1
 

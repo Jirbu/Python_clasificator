@@ -154,7 +154,7 @@ def process_video(
             ])
 
             # ── Hlavní smyčka ─────────────────────────────────────────────
-            for timestamp_ms, frame in loader.frame_generator():
+            for timestamp_ms, frame, prev_frame in loader.frame_generator():
                 frames_processed += 1
 
                 # FPS counter: aktualizuj každou sekundu
@@ -169,7 +169,7 @@ def process_video(
                 # results[0] = Person 1, results[1] = Person 2
                 # slot0_lost = True pokud Person 1 právě přešla TRACKING→LOST
                 results, slot0_lost = multi_manager.update(
-                    frame, timestamp_ms, pose_detector, image_detector
+                    frame, timestamp_ms, pose_detector, image_detector, prev_frame
                 )
                 r0 = results[0]  # Person 1
                 r1 = results[1]  # Person 2
