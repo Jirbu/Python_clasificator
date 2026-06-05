@@ -37,6 +37,7 @@ from classifier import ActionClassifier
 from visualizer import Visualizer
 from jump_detector import JumpDetector
 from person_manager import PersonManager
+from torso_angle import compute_torso_angle
 
 # ── Konfigurace loggeru ───────────────────────────────────────────────────────
 logging.basicConfig(
@@ -113,6 +114,14 @@ def process_video(
     frames_no_pose   = 0
     frames_invalid   = 0
 
+    # Statistiky backup fallbacku a timing
+    # backup_level: 0=bez backupu, 1=L1 stačil, 2=L2 stačil, 9=vše selhalo
+    backup_counts: dict[int, int]       = {0: 0, 1: 0, 2: 0, 9: 0}
+    backup_times:  dict[int, list[float]] = {0: [], 1: [], 2: [], 9: []}
+
+    # Buffer řádků pro post-processing highlight s ±2 oknem
+    frame_rows: list[dict] = []
+
     fps_timer   = time.time()
     fps_counter = 0
     current_fps = 0.0
@@ -144,7 +153,7 @@ def process_video(
                 logger.info("  Debug video: %s", debug_output_path)
 
             writer = csv.writer(csv_file)
-            writer.writerow(["timestamp_ms", "highlight", "is_jump", "action"])  # CSV hlavička
+            # CSV hlavička bude zapsána při post-processingu na konci
 
             pipe_writer = csv.writer(pipe_csv_file)
             pipe_writer.writerow([
@@ -156,6 +165,7 @@ def process_video(
             # ── Hlavní smyčka ─────────────────────────────────────────────
             for timestamp_ms, frame, prev_frame in loader.frame_generator():
                 frames_processed += 1
+                t_frame_start = time.perf_counter()
 
                 # FPS counter: aktualizuj každou sekundu
                 fps_counter += 1
@@ -173,6 +183,12 @@ def process_video(
                 )
                 r0 = results[0]  # Person 1
                 r1 = results[1]  # Person 2
+
+                # Zaznamenej backup level a čas zpracování tohoto snímku
+                backup_level = r0.get("backup_level", 0)
+                frame_duration_ms = (time.perf_counter() - t_frame_start) * 1000.0
+                backup_counts[backup_level] = backup_counts.get(backup_level, 0) + 1
+                backup_times.setdefault(backup_level, []).append(frame_duration_ms)
 
                 # Pipeline debug CSV — jeden řádek na každý snímek
                 pd_ = r0.get("pipe_debug", {})
@@ -242,13 +258,21 @@ def process_video(
 
                 confidence = conf_dict.get(action, 0.0)
 
-                # Highlight = ne-normální akce A zároveň fyzikálně detekovaný skok
-                highlight = (action not in (None, "normal", "unknown")) and physics_is_jump
-                if highlight:
-                    highlight_timestamps.append(timestamp_ms)
+                # Výpočet úhlu torza (pro debug vizualizaci)
+                torso_angle = compute_torso_angle(landmarks) if landmarks is not None else None
 
-                # Zápis do CSV
-                writer.writerow([f"{timestamp_ms:.0f}", str(highlight), str(physics_is_jump), action])
+                # Highlight – předběžné vyhodnocení (bude přepočítáno s ±2 oknem na konci)
+                is_acrobatic = action not in (None, "normal", "unknown")
+                highlight = is_acrobatic and physics_is_jump
+
+                # Buffering řádku pro post-processing ±2 okno
+                frame_rows.append({
+                    "timestamp_ms": f"{timestamp_ms:.0f}",
+                    "is_jump":      physics_is_jump,
+                    "backup":       backup_level,
+                    "action":       action,
+                    "is_acrobatic": is_acrobatic,
+                })
                 rows_written += 1
 
                 # Debug: skelet + akce
@@ -256,6 +280,7 @@ def process_video(
                     visualizer.write_frame(
                         frame, action, timestamp_ms, current_fps, p1=r0, p2=r1,
                         jump_detector=jump_detector,
+                        torso_angle=torso_angle,
                     )
 
     finally:
@@ -274,6 +299,52 @@ def process_video(
         frames_processed, frames_processed - frames_no_pose - frames_invalid,
         rows_written, frames_no_pose, frames_invalid, elapsed,
     )
+
+    # ── Post-processing: highlight s ±2 oknem ────────────────────────────────
+    # highlight = is_acrobatic AND (is_jump True v libovolném z ±2 okolních snímků)
+    n = len(frame_rows)
+    is_jump_arr = [r["is_jump"] for r in frame_rows]
+    for i, row in enumerate(frame_rows):
+        window = is_jump_arr[max(0, i - 2): i + 3]   # ±2 snímků
+        row["highlight"] = row["is_acrobatic"] and any(window)
+
+    # Zápis do CSV
+    with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
+        w = csv.writer(csv_file)
+        w.writerow(["timestamp_ms", "highlight", "is_jump", "backup", "action"])
+        for row in frame_rows:
+            w.writerow([
+                row["timestamp_ms"],
+                str(row["highlight"]),
+                str(row["is_jump"]),
+                str(row["backup"]),
+                row["action"],
+            ])
+            if row["highlight"]:
+                highlight_timestamps.append(float(row["timestamp_ms"]))
+
+    # ── Sumarizace backup fallbacku ──────────────────────────────────────────
+    total_frames = sum(backup_counts.values())
+    total_backup = total_frames - backup_counts.get(0, 0)
+
+    def _avg_ms(level: int) -> str:
+        times = backup_times.get(level, [])
+        return f"{sum(times)/len(times):.1f} ms" if times else "n/a"
+
+    print(f"\n{'='*55}")
+    print("BACKUP FALLBACK – SUMARIZACE")
+    print(f"{'='*55}")
+    print(f"  Celkem snímků zpracováno : {total_frames}")
+    print(f"  Bez backupu  (0) : {backup_counts.get(0,0):5d}  ({backup_counts.get(0,0)/max(1,total_frames)*100:.1f} %)  prům. čas: {_avg_ms(0)}")
+    print(f"  Backup L1    (1) : {backup_counts.get(1,0):5d}  ({backup_counts.get(1,0)/max(1,total_frames)*100:.1f} %)  prům. čas: {_avg_ms(1)}")
+    print(f"  Backup L2    (2) : {backup_counts.get(2,0):5d}  ({backup_counts.get(2,0)/max(1,total_frames)*100:.1f} %)  prům. čas: {_avg_ms(2)}")
+    print(f"  Vše selhalo  (9) : {backup_counts.get(9,0):5d}  ({backup_counts.get(9,0)/max(1,total_frames)*100:.1f} %)  prům. čas: {_avg_ms(9)}")
+    print(f"  ── Snímků vyžadujících backup: {total_backup} ({total_backup/max(1,total_frames)*100:.1f} %)")
+    if total_backup > 0:
+        print(f"  ── Z nich zachráněno L1 : {backup_counts.get(1,0)/total_backup*100:.1f} %")
+        print(f"  ── Z nich zachráněno L2 : {backup_counts.get(2,0)/total_backup*100:.1f} %")
+        print(f"  ── Z nich nezachráněno  : {backup_counts.get(9,0)/total_backup*100:.1f} %")
+    print('='*55)
 
     # Výpis highlight timestampů
     if highlight_timestamps:

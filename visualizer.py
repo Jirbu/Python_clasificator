@@ -175,6 +175,7 @@ class Visualizer:
         p1: dict | None = None,
         p2: dict | None = None,
         jump_detector=None,
+        torso_angle: float | None = None,
     ) -> None:
         """
         Nakreslí všechny overlays a zapíše snímek do videa.
@@ -195,7 +196,7 @@ class Visualizer:
 
         # P1 overlays
         if p1 is not None:
-            self._draw_person(vis, p1, person_id=1)
+            self._draw_person(vis, p1, person_id=1, torso_angle=torso_angle)
             self._draw_motion_limbs(vis, p1.get("motion_info", {}))
 
         # P2 overlays
@@ -353,7 +354,7 @@ class Visualizer:
 
     # ── Per-osoba ─────────────────────────────────────────────────────────────
 
-    def _draw_person(self, frame: np.ndarray, result: dict, person_id: int) -> None:
+    def _draw_person(self, frame: np.ndarray, result: dict, person_id: int, torso_angle: float | None = None) -> None:
         """Kreslí vše pro jednu osobu: skeleton, bbox, crop region, scores."""
         h, w = frame.shape[:2]
 
@@ -434,7 +435,7 @@ class Visualizer:
 
         # ── Scores panel na středu torsa ──────────────────────────────
         if is_p1:
-            self._draw_p1_scores(frame, result, raw_lm)
+            self._draw_p1_scores(frame, result, raw_lm, torso_angle=torso_angle)
         else:
             self._draw_p2_scores(frame, result, raw_lm)
 
@@ -584,6 +585,7 @@ class Visualizer:
         frame: np.ndarray,
         result: dict,
         raw_lm: np.ndarray | None,
+        torso_angle: float | None = None,
     ) -> None:
         """
         Scores panel pro Person 1 – ukotvený na středu torsa.
@@ -619,7 +621,7 @@ class Visualizer:
         pose_scale_err   = result.get("pose_scale_err", 0.0)
         pose_scale_detail = result.get("pose_scale_detail", {})
         susp_color     = (0, 60, 220) if pose_suspicious else (0, 230, 80)
-        scale_color    = (0, 60, 220) if pose_scale_err > 0.30 else (0, 230, 80)
+        scale_color    = (0, 60, 220) if pose_scale_err > 0.45 else (0, 230, 80)
 
         # Jump L1 debug: delta_y vs threshold_amp v pixelech
         jd = getattr(self, "_last_jump_detector", None)
@@ -657,6 +659,12 @@ class Visualizer:
             (f"scale_err:   {pose_scale_err:.3f}",                                         scale_color),
             (f"  sc: " + " ".join(f"{k[:4]}={v['rel']:.2f}" if isinstance(v, dict) else f"{k[:4]}={v:.2f}" for k, v in pose_scale_detail.items()), scale_color),
         ]
+        # Torso angle řádek
+        if torso_angle is not None:
+            angle_color = (0, 200, 80) if torso_angle > 80.0 else (200, 120, 30)
+            lines.append((f"torso_angle: {torso_angle:.1f}\u00b0", angle_color))
+        else:
+            lines.append(("torso_angle: n/a", (100, 100, 100)))
         if _SCALE_DEBUG and pose_scale_detail:
             _SEG_SHORT = {
                 "torso_h": "torso_h", "shoulder_w": "shou_w",

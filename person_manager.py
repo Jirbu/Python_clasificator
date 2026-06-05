@@ -89,6 +89,9 @@ _FINAL_THR    = 0.30   # min final_conf pro pipeline SUCCESS
 _SCALE_SWITCH_THR      = 0.45   # min scale_err pro detekci přeskoku
 _SCALE_SWITCH_APPEAR   = 0.80   # max appearance_score při přeskoku (nízká = jiná osoba)
 
+# overlap check – zamítnutí P2 pokud se překrývá s P1
+_OVERLAP_SAME_PERSON_THR = 0.50  # průměrné překrytí bbox nad tímto prahem → stejná osoba
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -107,6 +110,63 @@ def _hip_center(lm: np.ndarray) -> np.ndarray:
     ir = LANDMARK_INDEX["right_hip"]
     return np.array([(lm[il, 0] + lm[ir, 0]) / 2.0,
                      (lm[il, 1] + lm[ir, 1]) / 2.0])
+
+
+# Definice skupin landmarků pro overlap check (shodné s motion_validator)
+_OVERLAP_LIMB_DEFS: list[dict] = [
+    {"name": "torso",     "keys": ["left_shoulder", "right_shoulder", "left_hip", "right_hip"]},
+    {"name": "left_arm",  "keys": ["left_shoulder", "left_elbow", "left_wrist"]},
+    {"name": "right_arm", "keys": ["right_shoulder", "right_elbow", "right_wrist"]},
+    {"name": "left_leg",  "keys": ["left_hip", "left_knee", "left_ankle"]},
+    {"name": "right_leg", "keys": ["right_hip", "right_knee", "right_ankle"]},
+]
+_OVERLAP_LIMBS: list[dict] = [
+    {"name": d["name"], "indices": [LANDMARK_INDEX[k] for k in d["keys"]]}
+    for d in _OVERLAP_LIMB_DEFS
+]
+
+
+def _compute_limb_bboxes(
+    lm: np.ndarray,
+    frame_wh: tuple[int, int],
+    padding_frac: float = 0.03,
+) -> dict[str, tuple[int, int, int, int]]:
+    """Spočítá bounding boxy (v px) per-limb z normalized landmarks.
+
+    Vrátí dict {limb_name: (x1, y1, x2, y2)} pouze pro limby s dostatkem
+    viditelných landmarků.
+    """
+    fw, fh = frame_wh
+    pad_x = int(padding_frac * fw)
+    pad_y = int(padding_frac * fh)
+    result: dict[str, tuple[int, int, int, int]] = {}
+    for limb in _OVERLAP_LIMBS:
+        vis = [(lm[i, 0], lm[i, 1]) for i in limb["indices"] if lm[i, 3] > 0.2]
+        if not vis:
+            continue
+        x1 = max(0,  int(min(p[0] for p in vis) * fw) - pad_x)
+        y1 = max(0,  int(min(p[1] for p in vis) * fh) - pad_y)
+        x2 = min(fw, int(max(p[0] for p in vis) * fw) + pad_x)
+        y2 = min(fh, int(max(p[1] for p in vis) * fh) + pad_y)
+        if (x2 - x1) >= 4 and (y2 - y1) >= 4:
+            result[limb["name"]] = (x1, y1, x2, y2)
+    return result
+
+
+def _bbox_overlap_fraction(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> float:
+    """Vrátí překrytí jako zlomek menšího z obou bbox (0.0 – 1.0)."""
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+    # Překrytí vůči menšímu bbox (konzervativnější, detekuje i containment)
+    return inter / min(area_a, area_b)
 
 
 def _compute_crop(
@@ -446,31 +506,56 @@ class PersonManager:
         _snap0 = _snapshot_slot_validators(slot)
         result = self._score_and_decide(slot, frame, effective_lm, kin_score, pipe_used)
 
-        # Hires fallback: pokud suspicious a máme aktivní crop, zkusíme znovu s vyšším rozlišením
-        # Preferujeme prev_frame (přeskočený snímek těsně před tímto) – bývá čistší
-        if result.get("pose_suspicious") and slot.state in (slot.TRACKING, slot.GHOST, slot.LOST):
-            hires_crop = slot.crop if slot.state != slot.LOST else slot.frozen_crop
-            hires_source_frame = prev_frame if prev_frame is not None else frame
-            hires_source_label = "prev_frame" if prev_frame is not None else "current_frame"
+        # ── Víceúrovňový fallback pro suspicious snímek ────────────────────────
+        # Spouští se pouze pokud je snímek suspicious a slot je aktivní.
+        # Preferuje prev_frame (přeskočený snímek těsně před tímto) jako zdroj.
+        # Level 1: prev_frame normální rozlišení (stejný detektor jako crop pipeline)
+        # Level 2: prev_frame hires rozlišení (512×288, pomalejší ale přesnější)
+        # backup_level: 0=není potřeba, 1=L1 stačil, 2=L2 stačil, 9=oboje selhalo
+        backup_level = 0
+        if (result.get("pose_suspicious") or effective_lm is None) and slot.state in (slot.TRACKING, slot.GHOST, slot.LOST):
+            fb_crop        = slot.crop if slot.state != slot.LOST else slot.frozen_crop
+            fb_frame       = prev_frame if prev_frame is not None else frame
+            fb_label       = "prev_frame" if prev_frame is not None else "current_frame"
+            is_relaxed_fb  = slot.state in (slot.GHOST, slot.LOST)
+            backup_level   = 9  # pesimistický výchozí stav
+
+            # Level 1: normální rozlišení na fb_frame
             logger.info(
-                "Slot 0: snímek suspicious (pose_param=%.3f) – spouštím hires fallback (512×288) na %s",
-                result.get("pose_param", 0.0),
-                hires_source_label,
+                "Slot 0: suspicious (pose_param=%.3f) – backup L1 normální rozlišení na %s",
+                result.get("pose_param", 0.0), fb_label,
             )
-            lm_hires = self._detect_in_crop_hires(hires_source_frame, hires_crop, image_detector)
-            if lm_hires is not None:
-                is_relaxed_hires = slot.state in (slot.GHOST, slot.LOST)
-                hires_ok, lm_h, kin_h, _, _, _ = self._early_filter(
-                    slot, lm_hires, relaxed_kin=is_relaxed_hires
+            lm_l1 = self._detect_in_crop(fb_frame, fb_crop, image_detector)
+            if lm_l1 is not None:
+                l1_ok, lm_l1v, kin_l1, _, _, _ = self._early_filter(
+                    slot, lm_l1, relaxed_kin=is_relaxed_fb
                 )
-                if hires_ok:
-                    logger.info("Slot 0: hires fallback ÚSPĚŠNÝ – výsledek přepsán hires detekcí")
+                if l1_ok:
+                    logger.info("Slot 0: backup L1 ÚSPĚŠNÝ")
                     _restore_slot_validators(slot, _snap0)
-                    result = self._score_and_decide(slot, frame, lm_h, kin_h, "crop_hires")
+                    result       = self._score_and_decide(slot, frame, lm_l1v, kin_l1, "crop")
+                    backup_level = 1
+
+            # Level 2: hires rozlišení – pouze pokud L1 selhal
+            if backup_level == 9:
+                logger.info("Slot 0: L1 selhal – zkouším backup L2 hires (512×288) na %s", fb_label)
+                lm_l2 = self._detect_in_crop_hires(fb_frame, fb_crop, image_detector)
+                if lm_l2 is not None:
+                    l2_ok, lm_l2v, kin_l2, _, _, _ = self._early_filter(
+                        slot, lm_l2, relaxed_kin=is_relaxed_fb
+                    )
+                    if l2_ok:
+                        logger.info("Slot 0: backup L2 hires ÚSPĚŠNÝ")
+                        _restore_slot_validators(slot, _snap0)
+                        result       = self._score_and_decide(slot, frame, lm_l2v, kin_l2, "crop_hires")
+                        backup_level = 2
+                    else:
+                        logger.debug("Slot 0: backup L2 selhal (early filter zamítl)")
                 else:
-                    logger.debug("Slot 0: hires fallback selhal (early filter zamítl)")
-            else:
-                logger.debug("Slot 0: hires fallback – detekce vrátila None")
+                    logger.debug("Slot 0: backup L2 – detekce vrátila None")
+
+            if backup_level == 9:
+                logger.info("Slot 0: všechny backup úrovně selhaly")
 
         # Přechod stavů
         lost_transition = self._apply_state(slot, result)
@@ -483,6 +568,7 @@ class PersonManager:
             "frozen_crop":   slot.frozen_crop,
             "detection_crop": detection_crop,
             "pipe_debug":    pipe_debug,
+            "backup_level":  backup_level,
             "kin_predicted": (float(slot.kin_predicted[0]), float(slot.kin_predicted[1])) if slot.kin_predicted is not None else None,
         }
         return r0, lost_transition
@@ -511,6 +597,29 @@ class PersonManager:
         effective_lm = lm_v  if full_ok else None
         kin_score    = kin_v if full_ok else 0.0
         pipe_used    = "crop" if full_ok else "none"
+
+        # ── Overlap check: zamítni slot 1 pokud detekuje stejnou osobu jako slot 0 ──
+        # Slot 0 má už bboxes předpočítané v "limb_bboxes_px" – žádný extra výpočet.
+        # Pro slot 1 počítáme bboxes jen když máme co porovnávat.
+        if effective_lm is not None:
+            bboxes0: dict[str, tuple] = r0.get("limb_bboxes_px") or {}
+            bboxes1 = _compute_limb_bboxes(effective_lm, self._frame_wh) if bboxes0 else {}
+            overlaps = [
+                _bbox_overlap_fraction(bboxes1[name], bboxes0[name])
+                for name in bboxes1
+                if name in bboxes0
+            ]
+            if overlaps:
+                avg_overlap = float(np.mean(overlaps))
+                if avg_overlap >= _OVERLAP_SAME_PERSON_THR:
+                    logger.info(
+                        "Slot 1: overlap check → stejná osoba jako slot 0 "
+                        "(avg_overlap=%.2f >= %.2f) – detekce zamítnuta",
+                        avg_overlap, _OVERLAP_SAME_PERSON_THR,
+                    )
+                    effective_lm = None
+                    kin_score    = 0.0
+                    pipe_used    = "none"
 
         _snap1 = _snapshot_slot_validators(slot)
         result = self._score_and_decide(slot, frame, effective_lm, kin_score, pipe_used)
@@ -718,6 +827,11 @@ class PersonManager:
             "kin_score":        round(kin_score, 3),
             "track_info":       track_info,
             "motion_info":      motion_info,
+            "limb_bboxes_px":   {
+                name: info["roi_orig"]
+                for name, info in motion_info.get("limb_debug", {}).items()
+                if info.get("roi_orig") is not None
+            },
             "pipeline_used":    pipe_used,
             "pose_suspicious":  suspicious,
             "pose_param":       round(pose_param_score, 3),
@@ -889,6 +1003,23 @@ class PersonManager:
         if best_lm is None:
             self._candidate = None
             return
+
+        # Overlap check: zamítni kandidáta pokud se překrývá s P1
+        bboxes0: dict[str, tuple] = r0.get("limb_bboxes_px") or {}
+        if bboxes0:
+            bboxes_cand = _compute_limb_bboxes(best_lm, self._frame_wh)
+            overlaps = [
+                _bbox_overlap_fraction(bboxes_cand[name], bboxes0[name])
+                for name in bboxes_cand
+                if name in bboxes0
+            ]
+            if overlaps and float(np.mean(overlaps)) >= _OVERLAP_SAME_PERSON_THR:
+                logger.debug(
+                    "P2 scan: kandidát zamítnut – překryv s P1 (avg_overlap=%.2f)",
+                    float(np.mean(overlaps)),
+                )
+                self._candidate = None
+                return
 
         # Aktualizace / reset kandidáta
         if self._candidate is None:
