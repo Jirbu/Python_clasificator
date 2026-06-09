@@ -512,8 +512,21 @@ class PersonManager:
         # Level 1: prev_frame normální rozlišení (stejný detektor jako crop pipeline)
         # Level 2: prev_frame hires rozlišení (512×288, pomalejší ale přesnější)
         # backup_level: 0=není potřeba, 1=L1 stačil, 2=L2 stačil, 9=oboje selhalo
-        backup_level = 0
-        if (result.get("pose_suspicious") or effective_lm is None) and slot.state in (slot.TRACKING, slot.GHOST, slot.LOST):
+        # backup_trigger: "none" | "suspicious" | "no_detection"
+        backup_level   = 0
+        backup_trigger = "none"
+
+        _run_suspicious    = result.get("pose_suspicious") and slot.state in (slot.TRACKING, slot.GHOST, slot.LOST)
+        # no_detection fallback: spustí se jen pokud je stav TRACKING a pohyb předpovídaný
+        # trackerem přesahuje 1/2 průměrné délky torsa – tichá staticka snímky nebudeme
+        # zbytečně předetekovat drahým hires fallbackem.
+        _pred_disp  = slot.tracker.predicted_displacement          # norm. souř. [0,1]
+        _avg_torso  = slot.scale_detector.avg_torso_h              # norm. souř. nebo None
+        _moving     = (_avg_torso is not None and _pred_disp > 0.5 * _avg_torso)
+        _run_no_det = (effective_lm is None) and (slot.state == slot.TRACKING) and _moving
+
+        if _run_suspicious or _run_no_det:
+            backup_trigger = "suspicious" if result.get("pose_suspicious") else "no_detection"
             fb_crop        = slot.crop if slot.state != slot.LOST else slot.frozen_crop
             fb_frame       = prev_frame if prev_frame is not None else frame
             fb_label       = "prev_frame" if prev_frame is not None else "current_frame"
@@ -569,6 +582,7 @@ class PersonManager:
             "detection_crop": detection_crop,
             "pipe_debug":    pipe_debug,
             "backup_level":  backup_level,
+            "backup_trigger": backup_trigger,
             "kin_predicted": (float(slot.kin_predicted[0]), float(slot.kin_predicted[1])) if slot.kin_predicted is not None else None,
         }
         return r0, lost_transition

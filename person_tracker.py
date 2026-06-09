@@ -328,6 +328,15 @@ class PersonTracker:
 
         return person_present, debug_info
 
+    @property
+    def predicted_displacement(self) -> float:
+        """
+        Odhadovaná vzdálenost hip_center v příštím snímku oproti aktuální pozici.
+        Vrátí normu vyhlazené velocity v normalizovaných souřadnicích [0, 1].
+        0.0 pokud je osoba v klidu nebo pozice není ještě known.
+        """
+        return float(np.linalg.norm(self._velocity))
+
     def _get_predicted(self) -> np.ndarray:
         """Vrátí predikovanou pozici: last_pos + velocity (kinematický model 1. řádu)."""
         if self._position is None:

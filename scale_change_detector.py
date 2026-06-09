@@ -181,6 +181,16 @@ class ScaleChangeDetector:
 
         return self.last_scale_err
 
+    @property
+    def avg_torso_h(self) -> float | None:
+        """
+        Průměrná délka torsa (shoulder_center → hip_center) z aktuálního bufferu.
+        Vrátí None pokud buffer neobsahuje ani jeden snímek s `torso_h`.
+        Hodnota je v normalizovaných souřadnicích [0, 1] (výška torsa / výška framu).
+        """
+        vals = [d["torso_h"] for d in self._buffer if "torso_h" in d]
+        return float(np.mean(vals)) if vals else None
+
     def reset(self) -> None:
         self._buffer.clear()
         self.last_scale_err    = 0.0

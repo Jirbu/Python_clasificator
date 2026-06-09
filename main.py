@@ -116,8 +116,13 @@ def process_video(
 
     # Statistiky backup fallbacku a timing
     # backup_level: 0=bez backupu, 1=L1 stačil, 2=L2 stačil, 9=vše selhalo
-    backup_counts: dict[int, int]       = {0: 0, 1: 0, 2: 0, 9: 0}
+    backup_counts: dict[int, int]         = {0: 0, 1: 0, 2: 0, 9: 0}
     backup_times:  dict[int, list[float]] = {0: [], 1: [], 2: [], 9: []}
+    # Per-trigger statistiky: {"suspicious": {0:0,1:0,...}, "no_detection": {...}}
+    trigger_counts: dict[str, dict[int, int]] = {
+        "suspicious":   {1: 0, 2: 0, 9: 0},
+        "no_detection": {1: 0, 2: 0, 9: 0},
+    }
 
     # Buffer řádků pro post-processing highlight s ±2 oknem
     frame_rows: list[dict] = []
@@ -185,10 +190,14 @@ def process_video(
                 r1 = results[1]  # Person 2
 
                 # Zaznamenej backup level a čas zpracování tohoto snímku
-                backup_level = r0.get("backup_level", 0)
+                backup_level   = r0.get("backup_level", 0)
+                backup_trigger = r0.get("backup_trigger", "none")
                 frame_duration_ms = (time.perf_counter() - t_frame_start) * 1000.0
                 backup_counts[backup_level] = backup_counts.get(backup_level, 0) + 1
                 backup_times.setdefault(backup_level, []).append(frame_duration_ms)
+                if backup_trigger in trigger_counts and backup_level != 0:
+                    trigger_counts[backup_trigger][backup_level] = \
+                        trigger_counts[backup_trigger].get(backup_level, 0) + 1
 
                 # Pipeline debug CSV — jeden řádek na každý snímek
                 pd_ = r0.get("pipe_debug", {})
@@ -259,17 +268,29 @@ def process_video(
                 confidence = conf_dict.get(action, 0.0)
 
                 # Výpočet úhlu torza (pro debug vizualizaci)
-                torso_angle = compute_torso_angle(landmarks) if landmarks is not None else None
+                # Používáme _raw_lm – obsahuje landmarks i při fallbacku nebo nízkém final_conf
+                _raw_lm_for_angle = r0.get("_raw_lm")
+                torso_angle = compute_torso_angle(_raw_lm_for_angle) if _raw_lm_for_angle is not None else None
 
                 # Highlight – předběžné vyhodnocení (bude přepočítáno s ±2 oknem na konci)
                 is_acrobatic = action not in (None, "normal", "unknown")
                 highlight = is_acrobatic and physics_is_jump
 
+                # Enkóduj backup level + trigger do jediného CSV čísla:
+                #   no backup → 0
+                #   suspicious: L1→1, L2→2, failed→5
+                #   no_detection: L1→6, L2→7, failed→8
+                _CSV_BACKUP_MAP = {
+                    "suspicious":   {0: 0, 1: 1, 2: 2, 9: 5},
+                    "no_detection": {0: 0, 1: 6, 2: 7, 9: 8},
+                }
+                csv_backup = _CSV_BACKUP_MAP.get(backup_trigger, {}).get(backup_level, backup_level)
+
                 # Buffering řádku pro post-processing ±2 okno
                 frame_rows.append({
                     "timestamp_ms": f"{timestamp_ms:.0f}",
                     "is_jump":      physics_is_jump,
-                    "backup":       backup_level,
+                    "backup":       csv_backup,
                     "action":       action,
                     "is_acrobatic": is_acrobatic,
                 })
@@ -300,13 +321,10 @@ def process_video(
         rows_written, frames_no_pose, frames_invalid, elapsed,
     )
 
-    # ── Post-processing: highlight s ±2 oknem ────────────────────────────────
-    # highlight = is_acrobatic AND (is_jump True v libovolném z ±2 okolních snímků)
-    n = len(frame_rows)
-    is_jump_arr = [r["is_jump"] for r in frame_rows]
-    for i, row in enumerate(frame_rows):
-        window = is_jump_arr[max(0, i - 2): i + 3]   # ±2 snímků
-        row["highlight"] = row["is_acrobatic"] and any(window)
+    # ── Post-processing: highlight ────────────────────────────────────────────
+    # highlight = is_acrobatic AND is_jump na tomto konkrétním snímku
+    for row in frame_rows:
+        row["highlight"] = row["is_acrobatic"] and row["is_jump"]
 
     # Zápis do CSV
     with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
@@ -344,6 +362,21 @@ def process_video(
         print(f"  ── Z nich zachráněno L1 : {backup_counts.get(1,0)/total_backup*100:.1f} %")
         print(f"  ── Z nich zachráněno L2 : {backup_counts.get(2,0)/total_backup*100:.1f} %")
         print(f"  ── Z nich nezachráněno  : {backup_counts.get(9,0)/total_backup*100:.1f} %")
+
+    # Per-trigger detail
+    for trigger_key, trigger_label in [
+        ("suspicious",   "pose_suspicious (geom. chyba)"),
+        ("no_detection", "no_detection    (detekce selhala)"),
+    ]:
+        tc = trigger_counts[trigger_key]
+        t_total = sum(tc.values())
+        if t_total == 0:
+            continue
+        print(f"  {'─'*51}")
+        print(f"  Příčina: {trigger_label}  → celkem {t_total} snímků")
+        print(f"    zachráněno L1 : {tc.get(1,0):4d}  ({tc.get(1,0)/t_total*100:.1f} %)")
+        print(f"    zachráněno L2 : {tc.get(2,0):4d}  ({tc.get(2,0)/t_total*100:.1f} %)")
+        print(f"    nezachráněno  : {tc.get(9,0):4d}  ({tc.get(9,0)/t_total*100:.1f} %)")
     print('='*55)
 
     # Výpis highlight timestampů

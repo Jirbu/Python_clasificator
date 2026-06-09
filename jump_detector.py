@@ -316,21 +316,25 @@ class JumpDetector:
         if len(t_norm) >= 3:
             t_head = t_norm[:-1]
             y_head = y_arr[:-1]
-            try:
-                lin_coeffs = np.polyfit(t_head, y_head, 1)
-                y_head_fit  = np.polyval(lin_coeffs, t_head)
-                lin4_err    = float(np.mean(np.abs(y_head - y_head_fit)))
-                fifth_err   = float(abs(y_arr[-1] - np.polyval(lin_coeffs, t_norm[-1])))
-                self.last_lin4_err  = lin4_err
-                self.last_fifth_err = fifth_err
-                if lin4_err > 1e-6 and fifth_err > 10.0 * lin4_err:
-                    # Extrémní outlier → označíme poslední bod jako nevalidní
-                    self._buffer[-1]["valid"] = False
-                if lin4_err > 1e-6 and fifth_err > self.outlier_err_ratio * lin4_err:
-                    self.last_fail_reason = "outlier"
-                    return False
-            except (np.linalg.LinAlgError, ValueError):
-                pass
+            # Outlier check má smysl jen pokud máme dost bodů pro spolehlivý
+            # lineární fit – s méně než 3 body je fit vždy (téměř) dokonalý
+            # a lin4_err ≈ 0, takže by check nesprávně prošel nebo zamítl.
+            if len(t_head) >= 3:
+                try:
+                    lin_coeffs = np.polyfit(t_head, y_head, 1)
+                    y_head_fit  = np.polyval(lin_coeffs, t_head)
+                    lin4_err    = float(np.mean(np.abs(y_head - y_head_fit)))
+                    fifth_err   = float(abs(y_arr[-1] - np.polyval(lin_coeffs, t_norm[-1])))
+                    self.last_lin4_err  = lin4_err
+                    self.last_fifth_err = fifth_err
+                    if lin4_err > 1e-6 and fifth_err > 10.0 * lin4_err:
+                        # Extrémní outlier → označíme poslední bod jako nevalidní
+                        self._buffer[-1]["valid"] = False
+                    if lin4_err > 1e-6 and fifth_err > self.outlier_err_ratio * lin4_err:
+                        self.last_fail_reason = "outlier"
+                        return False
+                except (np.linalg.LinAlgError, ValueError):
+                    pass
 
         # ── L4: Minimální rychlost ───────────────────────────────────────
         dy = np.diff(y_arr)
