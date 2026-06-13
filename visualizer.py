@@ -31,6 +31,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from torso_angle import FREERUN_ANGLE_THR
+
 # ── Skeletal connections (MediaPipe Pose, 33 landmarks) ───────────────────────
 POSE_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 7),
@@ -176,6 +178,7 @@ class Visualizer:
         p2: dict | None = None,
         jump_detector=None,
         torso_angle: float | None = None,
+        freerun: bool = False,
     ) -> None:
         """
         Nakreslí všechny overlays a zapíše snímek do videa.
@@ -210,7 +213,7 @@ class Visualizer:
                 self._draw_jump_trajectory(vis, traj, p1)
 
         # Globální panel (vpravo nahoře)
-        self._draw_global_panel(vis, action, timestamp_ms, current_fps, p1)
+        self._draw_global_panel(vis, action, timestamp_ms, current_fps, p1, freerun=freerun)
 
         # HIGH RES badge (levý dolní roh) – zobrazí se pokud byl použit hires fallback
         if p1 is not None and p1.get("pipeline_used") == "crop_hires":
@@ -370,12 +373,13 @@ class Visualizer:
 
         # ── Skeleton ─────────────────────────────────────────────────────
         # landmarks = validní pipeline success; raw_lm = cokoliv co MediaPipe detekoval
+        scale_switch = result.get("scale_switch", False)
         draw_lm = landmarks if landmarks is not None else raw_lm
         pipeline_ok = landmarks is not None
         if draw_lm is not None:
             if is_p1:
                 self._draw_skeleton_p1(frame, draw_lm,
-                                       dimmed=(not pipeline_ok and valid_pose),
+                                       dimmed=(not pipeline_ok and valid_pose and not scale_switch),
                                        invalid=(not valid_pose))
             else:
                 self._draw_skeleton_p2(frame, draw_lm)
@@ -661,7 +665,7 @@ class Visualizer:
         ]
         # Torso angle řádek
         if torso_angle is not None:
-            angle_color = (0, 200, 80) if torso_angle > 80.0 else (200, 120, 30)
+            angle_color = (0, 200, 80) if torso_angle > FREERUN_ANGLE_THR else (200, 120, 30)
             lines.append((f"torso_angle: {torso_angle:.1f}\u00b0", angle_color))
         else:
             lines.append(("torso_angle: n/a", (100, 100, 100)))
@@ -787,6 +791,7 @@ class Visualizer:
         timestamp_ms: float,
         current_fps: float,
         p1: dict | None,
+        freerun: bool = False,
     ) -> None:
         """
         Debug panel vpravo nahoře:
@@ -801,7 +806,7 @@ class Visualizer:
         valid_pose     = p1.get("valid_pose", False)     if p1 else False
 
         panel_w = 220
-        panel_h = 128
+        panel_h = 148
         px = w - panel_w - 8
         py = 8
         lh = 20
@@ -836,6 +841,14 @@ class Visualizer:
         cv2.putText(frame, "jump_cl: ", (tx, ty), _FONT, _FONT_SM, (200, 200, 200), 1, cv2.LINE_AA)
         lx = tx + cv2.getTextSize("jump_cl: ", _FONT, _FONT_SM, 1)[0][0]
         cv2.putText(frame, jump_cl_text, (lx, ty), _FONT, _FONT_SM, jump_cl_color, 2, cv2.LINE_AA)
+        ty += lh
+
+        # freerun
+        freerun_text  = "TRUE" if freerun else "FALSE"
+        freerun_color = (0, 180, 255) if freerun else (0, 60, 220)
+        cv2.putText(frame, "freerun: ", (tx, ty), _FONT, _FONT_SM, (200, 200, 200), 1, cv2.LINE_AA)
+        lx = tx + cv2.getTextSize("freerun: ", _FONT, _FONT_SM, 1)[0][0]
+        cv2.putText(frame, freerun_text, (lx, ty), _FONT, _FONT_SM, freerun_color, 2, cv2.LINE_AA)
         ty += lh
 
         # Řádek 4: FINAL (odvozený label)

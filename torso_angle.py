@@ -27,7 +27,10 @@ import numpy as np
 
 from pose_detector import LANDMARK_INDEX
 
-_VIS_THR = 0.20
+_VIS_THR = 0.00
+
+# Práh úhlu torsa pro detekci freerun eventu (sdíleno s main.py a visualizer.py)
+FREERUN_ANGLE_THR: float = 80.0
 
 
 def _mid_or_single(lm: np.ndarray, key_l: str, key_r: str) -> np.ndarray | None:
@@ -81,3 +84,45 @@ def compute_torso_angle(lm: np.ndarray) -> float | None:
     axis_norm = axis / length
     cos_angle = float(np.clip(np.dot(axis_norm, np.array([0.0, -1.0])), -1.0, 1.0))
     return float(np.degrees(np.arccos(cos_angle)))
+
+
+def compute_torso_angle_debug(lm: np.ndarray | None) -> tuple[float | None, int]:
+    """
+    Stejné jako compute_torso_angle, ale navíc vrací kód zamítnutí:
+
+        0  = OK, úhel byl vypočítán
+        1  = lm je None (nebyly předány žádné landmarky)
+        2  = nos viditelný, ale ani kyčle ani ramena nejsou viditelné
+        3  = nos není viditelný a chybí kyčle NEBO ramena
+        4  = osa má nulovou délku (body splývají)
+    """
+    if lm is None:
+        return None, 1
+
+    nose_vis = lm[LANDMARK_INDEX["nose"], 3]
+    nose_xy  = lm[LANDMARK_INDEX["nose"], :2] if nose_vis >= _VIS_THR else None
+
+    hip_pt      = _mid_or_single(lm, "left_hip",      "right_hip")
+    shoulder_pt = _mid_or_single(lm, "left_shoulder", "right_shoulder")
+
+    if nose_xy is not None:
+        if hip_pt is not None:
+            base, top = hip_pt, nose_xy
+        elif shoulder_pt is not None:
+            base, top = shoulder_pt, nose_xy
+        else:
+            return None, 2
+    else:
+        if hip_pt is not None and shoulder_pt is not None:
+            base, top = hip_pt, shoulder_pt
+        else:
+            return None, 3
+
+    axis = top - base
+    length = float(np.linalg.norm(axis))
+    if length < 1e-6:
+        return None, 4
+
+    axis_norm = axis / length
+    cos_angle = float(np.clip(np.dot(axis_norm, np.array([0.0, -1.0])), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_angle))), 0

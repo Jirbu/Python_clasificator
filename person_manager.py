@@ -766,8 +766,11 @@ class PersonManager:
                 "Slot %d: scale switch detekován (scale_err=%.3f appear=%.3f) – detekce zamítnuta",
                 slot.slot_id, scale_err, appearance_score,
             )
-            valid_pose   = False
-            effective_lm = None
+            valid_pose        = False
+            _scale_switch_lm  = effective_lm   # uchováme pro vizualizaci (červeně)
+            effective_lm      = None
+        else:
+            _scale_switch_lm  = None
 
         # 7. PersonTracker (kinematika + temporální EMA)
         tracker_present, track_info = slot.tracker.update(
@@ -833,7 +836,8 @@ class PersonManager:
             "person_present":   person_present,
             "valid_pose":       valid_pose,
             "landmarks":        effective_lm if pipeline_success else None,
-            "_raw_lm":          effective_lm,
+            "_raw_lm":          _scale_switch_lm if scale_switch else effective_lm,
+            "scale_switch":     scale_switch,
             "final_conf":       round(final_conf, 3),
             "presence_prob":    round(presence_prob, 3),
             "sim_score":        round(sim_score, 3),

@@ -37,7 +37,7 @@ from classifier import ActionClassifier
 from visualizer import Visualizer
 from jump_detector import JumpDetector
 from person_manager import PersonManager
-from torso_angle import compute_torso_angle
+from torso_angle import compute_torso_angle, compute_torso_angle_debug, FREERUN_ANGLE_THR
 
 # ── Konfigurace loggeru ───────────────────────────────────────────────────────
 logging.basicConfig(
@@ -135,10 +135,14 @@ def process_video(
 
     try:
         pipe_csv_path = output_path.replace(".csv", "_pipeline_debug.csv")
+        jbuff_csv_path = output_path.replace(".csv", "_jump_buff.csv")
+        torso_csv_path = output_path.replace(".csv", "_torso_debug.csv")
         with (
             VideoLoader(video_path, target_fps=target_fps) as loader,
             open(output_path, "w", newline="", encoding="utf-8") as csv_file,
             open(pipe_csv_path, "w", newline="", encoding="utf-8") as pipe_csv_file,
+            open(jbuff_csv_path, "w", newline="", encoding="utf-8") as jbuff_file,
+            open(torso_csv_path, "w", newline="", encoding="utf-8") as torso_csv_file,
         ):
             info = loader.get_video_info()
             logger.info(
@@ -167,9 +171,22 @@ def process_video(
                 "fullframe", "fullframe_num", "fullframe_ref",
             ])
 
+            jbuff_writer = csv.writer(jbuff_file)
+            # Sloupce: timestamp_ms, debug_ms, buf_1 (nejnovější) .. buf_5 (nejstarší)
+            # debug_ms = čas v ms který zobrazuje přehrávač debug videa (= pořadí snímku / target_fps)
+            jbuff_writer.writerow(["timestamp_ms", "debug_ms", "buf_1", "buf_2", "buf_3", "buf_4", "buf_5"])
+
+            torso_writer = csv.writer(torso_csv_file)
+            # rejection_code: 0=OK, 1=lm None, 2=nos viditelný/žádný kloub, 3=nos neviditelný/chybí kyčle nebo ramena, 4=nulová osa
+            #                 5=osoba není přítomna (person_present=False), 6=ghost/neplatná poze
+            torso_writer.writerow(["timestamp_ms", "torso_angle", "rejection_code"])
+
             # ── Hlavní smyčka ─────────────────────────────────────────────
             for timestamp_ms, frame, prev_frame in loader.frame_generator():
                 frames_processed += 1
+                # Pořadí snímku v debug videu (0-based) + čas který ukáže přehrávač
+                _debug_frame_idx = frames_processed - 1
+                _debug_ms = _debug_frame_idx * (1000.0 / target_fps)
                 t_frame_start = time.perf_counter()
 
                 # FPS counter: aktualizuj každou sekundu
@@ -226,9 +243,28 @@ def process_video(
                 landmarks      = r0["landmarks"]
                 valid_pose     = r0["valid_pose"]
 
+                # Záloha bufferu jump_detectoru PŘED zápisem tohoto snímku.
+                # Pokud byl backup triggerován z důvodu no_detection (= landmarks pochází
+                # z prev_frame, ne z aktuálního snímku), restaurujeme snapshot a zapíšeme
+                # update_missing – aby trajektorie v bufferu byla časově konzistentní.
+                _jd_snap = jump_detector.snapshot()
+
                 # Pokud osoba není přítomna → zapsat debug a přeskočit klasifikaci
                 if not person_present:
                     jump_detector.update_missing(timestamp_ms)
+                    frame_rows.append({
+                        "timestamp_ms": f"{timestamp_ms:.0f}",
+                        "debug_ms":     f"{_debug_ms:.0f}",
+                        "is_jump":      False,
+                        "backup":       0,
+                        "action":       "",
+                        "is_acrobatic": False,
+                    })
+                    _jbuf_w = list(jump_detector._buffer)
+                    _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
+                    while len(_jbuf_v) < 5: _jbuf_v.append("")
+                    jbuff_writer.writerow([f"{timestamp_ms:.0f}", f"{_debug_ms:.0f}"] + _jbuf_v)
+                    torso_writer.writerow([f"{timestamp_ms:.0f}", "", 5])
                     if visualizer:
                         visualizer.write_frame(
                             frame, None, timestamp_ms, current_fps, p1=r0, p2=r1,
@@ -238,6 +274,19 @@ def process_video(
                 # Ghost frame: tracker říká present, ale nejsou platná landmarks
                 if not valid_pose or landmarks is None:
                     jump_detector.update_missing(timestamp_ms)
+                    frame_rows.append({
+                        "timestamp_ms": f"{timestamp_ms:.0f}",
+                        "debug_ms":     f"{_debug_ms:.0f}",
+                        "is_jump":      False,
+                        "backup":       0,
+                        "action":       "",
+                        "is_acrobatic": False,
+                    })
+                    _jbuf_w = list(jump_detector._buffer)
+                    _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
+                    while len(_jbuf_v) < 5: _jbuf_v.append("")
+                    jbuff_writer.writerow([f"{timestamp_ms:.0f}", f"{_debug_ms:.0f}"] + _jbuf_v)
+                    torso_writer.writerow([f"{timestamp_ms:.0f}", "", 6])
                     if visualizer:
                         visualizer.write_frame(
                             frame, None, timestamp_ms, current_fps, p1=r0, p2=r1,
@@ -246,18 +295,58 @@ def process_video(
 
                 features = feature_extractor.extract_features(landmarks)
 
-                # Fyzikální validace skoku (na každém validním snímku)
-                physics_is_jump = jump_detector.update(frame, landmarks, timestamp_ms)
+                # Fyzikální validace skoku (na každém validním snímku).
+                # Výjimka: no_detection backup → landmarks jsou z prev_frame,
+                # nikoli z aktuálního snímku. Restaurujeme snapshot bufferu a
+                # zapíšeme update_missing, aby trajektorie zůstala časově konzistentní.
+                _no_det_backup = (
+                    r0.get("backup_trigger") == "no_detection"
+                    and r0.get("backup_level") in (1, 2)
+                )
+                if _no_det_backup:
+                    jump_detector.restore(_jd_snap)
+                    physics_is_jump = jump_detector.update_missing(timestamp_ms)
+                else:
+                    physics_is_jump = jump_detector.update(frame, landmarks, timestamp_ms)
 
                 # Naplnění temporálního okna
+                # Enkóduj backup level + trigger do jediného CSV čísla:
+                #   no backup → 0
+                #   suspicious: L1→1, L2→2, failed→5
+                #   no_detection: L1→6, L2→7, failed→8
+                _CSV_BACKUP_MAP = {
+                    "suspicious":   {0: 0, 1: 1, 2: 2, 9: 5},
+                    "no_detection": {0: 0, 1: 6, 2: 7, 9: 8},
+                }
+                csv_backup = _CSV_BACKUP_MAP.get(backup_trigger, {}).get(backup_level, backup_level)
+
                 temporal_window.add_frame_features(features)
 
                 if not temporal_window.is_ready():
                     # Warm-up: skelet ano, akce ještě ne
+                    frame_rows.append({
+                        "timestamp_ms": f"{timestamp_ms:.0f}",
+                        "debug_ms":     f"{_debug_ms:.0f}",
+                        "is_jump":      physics_is_jump,
+                        "backup":       csv_backup,
+                        "action":       "",
+                        "is_acrobatic": False,
+                    })
+                    _jbuf_w = list(jump_detector._buffer)
+                    _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
+                    while len(_jbuf_v) < 5: _jbuf_v.append("")
+                    jbuff_writer.writerow([f"{timestamp_ms:.0f}", f"{_debug_ms:.0f}"] + _jbuf_v)
+                    _ta_warmup, _tr_warmup = compute_torso_angle_debug(r0.get("_raw_lm"))
+                    torso_writer.writerow([
+                        f"{timestamp_ms:.0f}",
+                        f"{_ta_warmup:.2f}" if _ta_warmup is not None else "",
+                        _tr_warmup,
+                    ])
                     if visualizer:
                         visualizer.write_frame(
                             frame, None, timestamp_ms, current_fps, p1=r0, p2=r1,
                             jump_detector=jump_detector,
+                            torso_angle=_ta_warmup,
                         )
                     continue
 
@@ -270,31 +359,42 @@ def process_video(
                 # Výpočet úhlu torza (pro debug vizualizaci)
                 # Používáme _raw_lm – obsahuje landmarks i při fallbacku nebo nízkém final_conf
                 _raw_lm_for_angle = r0.get("_raw_lm")
-                torso_angle = compute_torso_angle(_raw_lm_for_angle) if _raw_lm_for_angle is not None else None
+                torso_angle, _torso_rej = compute_torso_angle_debug(_raw_lm_for_angle)
+                torso_writer.writerow([
+                    f"{timestamp_ms:.0f}",
+                    f"{torso_angle:.2f}" if torso_angle is not None else "",
+                    _torso_rej,
+                ])
 
+                freerun = physics_is_jump and torso_angle is not None and torso_angle > FREERUN_ANGLE_THR
+                print(f"FR,{timestamp_ms:.0f},{physics_is_jump},{torso_angle is not None},{torso_angle is not None and torso_angle > FREERUN_ANGLE_THR},{torso_angle},{freerun}")
                 # Highlight – předběžné vyhodnocení (bude přepočítáno s ±2 oknem na konci)
                 is_acrobatic = action not in (None, "normal", "unknown")
                 highlight = is_acrobatic and physics_is_jump
 
-                # Enkóduj backup level + trigger do jediného CSV čísla:
-                #   no backup → 0
-                #   suspicious: L1→1, L2→2, failed→5
-                #   no_detection: L1→6, L2→7, failed→8
-                _CSV_BACKUP_MAP = {
-                    "suspicious":   {0: 0, 1: 1, 2: 2, 9: 5},
-                    "no_detection": {0: 0, 1: 6, 2: 7, 9: 8},
-                }
-                csv_backup = _CSV_BACKUP_MAP.get(backup_trigger, {}).get(backup_level, backup_level)
-
                 # Buffering řádku pro post-processing ±2 okno
                 frame_rows.append({
                     "timestamp_ms": f"{timestamp_ms:.0f}",
+                    "debug_ms":     f"{_debug_ms:.0f}",
                     "is_jump":      physics_is_jump,
                     "backup":       csv_backup,
                     "action":       action,
                     "is_acrobatic": is_acrobatic,
+                    "freerun":      freerun,
                 })
                 rows_written += 1
+
+                # Jump buffer debug CSV – stav bufferu po dokončení tohoto snímku
+                # buf_1 = nejnovější, buf_5 = nejstarší; prázdné sloty = ""
+                _jbuf = list(jump_detector._buffer)  # nejstarší → nejnovější
+                _jbuf_vals = [
+                    f"{e['y_corrected']:.5f}" if e["valid"] else ""
+                    for e in reversed(_jbuf)          # otočíme: buf_1 = [-1], buf_5 = [0]
+                ]
+                # Doplň na přesně 5 hodnot (pokud buffer ještě není plný)
+                while len(_jbuf_vals) < 5:
+                    _jbuf_vals.append("")
+                jbuff_writer.writerow([f"{timestamp_ms:.0f}", f"{_debug_ms:.0f}"] + _jbuf_vals)
 
                 # Debug: skelet + akce
                 if visualizer:
@@ -302,6 +402,7 @@ def process_video(
                         frame, action, timestamp_ms, current_fps, p1=r0, p2=r1,
                         jump_detector=jump_detector,
                         torso_angle=torso_angle,
+                        freerun=freerun,
                     )
 
     finally:
@@ -322,19 +423,21 @@ def process_video(
     )
 
     # ── Post-processing: highlight ────────────────────────────────────────────
-    # highlight = is_acrobatic AND is_jump na tomto konkrétním snímku
+    # highlight = (is_acrobatic AND is_jump) OR freerun
     for row in frame_rows:
-        row["highlight"] = row["is_acrobatic"] and row["is_jump"]
+        row["highlight"] = (row["is_acrobatic"] and row["is_jump"]) or row.get("freerun", False)
 
     # Zápis do CSV
     with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
         w = csv.writer(csv_file)
-        w.writerow(["timestamp_ms", "highlight", "is_jump", "backup", "action"])
+        w.writerow(["timestamp_ms", "debug_ms", "highlight", "is_jump", "freerun", "backup", "action"])
         for row in frame_rows:
             w.writerow([
                 row["timestamp_ms"],
+                row["debug_ms"],
                 str(row["highlight"]),
                 str(row["is_jump"]),
+                str(row.get("freerun", False)),
                 str(row["backup"]),
                 row["action"],
             ])

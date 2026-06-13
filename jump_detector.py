@@ -244,7 +244,7 @@ class JumpDetector:
         buf = list(self._buffer)
 
         # Krajní body (0 a -1) musí být platné
-        if not buf[0]["valid"] or not buf[-1]["valid"]:
+        if not buf[-1]["valid"]:
             self.last_is_jump       = False
             self.last_fail_reason   = "buf"
             self.last_delta_y       = 0.0
@@ -428,6 +428,24 @@ class JumpDetector:
             "parabola_abc": parabola_abc,
             "is_jump":      self.last_is_jump,
         }
+
+    # ── Snapshot / Restore ─────────────────────────────────────────────────
+
+    def snapshot(self) -> object:
+        """
+        Vrátí záložní kopii bufferu (hloubková kopie).
+        Použij těsně před volání update() / update_missing() daného snímku.
+        """
+        import copy
+        return copy.deepcopy(self._buffer)
+
+    def restore(self, snap: object) -> None:
+        """
+        Obnoví buffer ze zálohy pořízené metodou snapshot().
+        Zavolej před opakovaným zpracováním snímku (např. po fallbacku).
+        """
+        from collections import deque
+        self._buffer = deque(snap, maxlen=self.buffer_size)
 
     # ── Reset ──────────────────────────────────────────────────────────────────
 
