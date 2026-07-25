@@ -1,128 +1,107 @@
-"""
-flip_detector.py
-----------------
-Detekce přemetu (flip) z průběhu úhlu torsa.
-
-Vstup: sekvence úhlů torsa v rozmezí 0–360° (výstup torso_angle.compute_torso_angle).
-Výstup: True pokud v posledních `window_size` snímcích docházelo k rotaci (flip).
-
-Stavy:
-    IDLE  – bez výrazné rotace (|Δθ| < rot_threshold)
-    CW    – rotace po směru hodinových ručiček  (Δθ >=  rot_threshold)
-    CCW   – rotace proti směru hodinových ručiček (Δθ <= -rot_threshold)
-
-Flip je detekován pokud alespoň `flip_threshold` (výchozí 70 %) snímků v okně
-je ve stavu CW nebo CCW.
-
-Bez externích závislostí – používá pouze numpy.
-"""
-
-from __future__ import annotations
-
-from collections import deque
-
+import math
 import numpy as np
 
 
-# ── Pomocná funkce ─────────────────────────────────────────────────────────
+def angle_diff(a, b):
+    """Rozdíl úhlů <-180,180>."""
+    return ((b - a + 180) % 360) - 180
 
-def angle_diff(a: float, b: float) -> float:
-    """
-    Vrátí orientovaný rozdíl úhlů v intervalu (-180, 180].
-    Správně zachází s přechodem přes 0°/360°.
-    """
-    return ((b - a + 180.0) % 360.0) - 180.0
-
-
-# ── Hlavní detektor ────────────────────────────────────────────────────────
 
 class FlipDetector:
-    """
-    Detekuje přemet (flip) z průběhu úhlu torsa.
 
-    Parametry:
-        window_size     – počet posledních snímků pro vyhodnocení (výchozí 8)
-        flip_threshold  – minimální podíl snímků v rotačním stavu pro detekci (0–1)
-        rot_threshold   – minimální |Δθ| [stupně/snímek] pro klasifikaci jako CW/CCW
-    """
+    IDLE = 0
+    CW = 1
+    CCW = 2
 
     STATE_NAMES = ["IDLE", "CW", "CCW"]
 
-    def __init__(
-        self,
-        window_size:    int   = 8,
-        flip_threshold: float = 0.70,
-        rot_threshold:  float = 7.5,
-    ):
-        self.window_size    = window_size
-        self.flip_threshold = flip_threshold
-        self.rot_threshold  = rot_threshold
+    def __init__(self):
 
-        # Buffer ukládá až window_size+1 úhlů (pro výpočet window_size delt)
-        self._angle_buf: deque[float] = deque(maxlen=window_size + 1)
+        self.last_angle = None
 
-        # Diagnostika
-        self.last_is_flip:        bool      = False
-        self.last_flip_prob:      float     = 0.0
-        self.last_dominant_state: str       = "IDLE"
-        self.last_states:         list[str] = []
+        # počáteční pravděpodobnosti
+        self.p = np.array([
+            0.98,
+            0.01,
+            0.01
+        ], dtype=float)
 
-    # ── Veřejné API ────────────────────────────────────────────────────────
+        # přechody mezi stavy
+        self.A = np.array([
+            [0.97, 0.02, 0.01],
+            [0.02, 0.97, 0.01],
+            [0.02, 0.01, 0.97]
+        ], dtype=float)
 
-    def update(self, angle: float | None) -> bool:
-        """
-        Přidá nový úhel torsa do bufferu a vyhodnotí přítomnost flipu.
+        # očekávané Δθ
+        self.mu = np.array([
+            0.0,
+            15.0,
+            -15.0
+        ])
 
-        Parametry:
-            angle – úhel torsa 0–360° (None = osoba není viditelná)
+        # směrodatná odchylka měření
+        self.sigma = np.array([
+            8.0,
+            10.0,
+            10.0
+        ])
 
-        Vrátí:
-            True pokud je detekován flip v aktuálním okně.
-        """
+    def gaussian(self, x, mu, sigma):
+        return math.exp(
+            -0.5 * ((x - mu) / sigma) ** 2
+        )
+
+    def update(self, angle):
+
         if angle is None:
-            self._angle_buf.clear()
-            self.last_is_flip        = False
-            self.last_flip_prob      = 0.0
-            self.last_dominant_state = "IDLE"
-            self.last_states         = []
+            self.last_angle = None
+            self.p[:] = [0.98, 0.01, 0.01]
             return False
 
-        self._angle_buf.append(angle)
-
-        if len(self._angle_buf) < 2:
-            self.last_is_flip = False
+        if self.last_angle is None:
+            self.last_angle = angle
             return False
 
-        angles = list(self._angle_buf)
-        deltas = [angle_diff(angles[i], angles[i + 1]) for i in range(len(angles) - 1)]
+        dtheta = angle_diff(self.last_angle, angle)
+        self.last_angle = angle
 
-        thr = self.rot_threshold
-        states = []
-        for d in deltas:
-            if d >= thr:
-                states.append(1)   # CW
-            elif d <= -thr:
-                states.append(2)   # CCW
-            else:
-                states.append(0)   # IDLE
+        # -----------------------------------------
+        # Prediction
+        # -----------------------------------------
 
-        n = len(states)
-        rotation_count = sum(1 for s in states if s != 0)
-        flip_prob = rotation_count / n
+        pred = self.p @ self.A
 
-        counts   = [states.count(i) for i in range(3)]
-        dominant = int(np.argmax(counts))
+        # -----------------------------------------
+        # Likelihood
+        # -----------------------------------------
 
-        self.last_flip_prob      = float(flip_prob)
-        self.last_dominant_state = self.STATE_NAMES[dominant]
-        self.last_states         = [self.STATE_NAMES[s] for s in states]
-        self.last_is_flip        = flip_prob >= self.flip_threshold
-        return self.last_is_flip
+        likelihood = np.array([
+            self.gaussian(dtheta, self.mu[0], self.sigma[0]),
+            self.gaussian(dtheta, self.mu[1], self.sigma[1]),
+            self.gaussian(dtheta, self.mu[2], self.sigma[2]),
+        ])
+
+        # -----------------------------------------
+        # Bayes update
+        # -----------------------------------------
+
+        self.p = pred * likelihood
+        self.p /= np.sum(self.p)
+
+        flip_probability = self.p[self.CW] + self.p[self.CCW]
+
+        return flip_probability > 0.8
+
+    @property
+    def flip_probability(self):
+        return self.p[self.CW] + self.p[self.CCW]
+
+    @property
+    def state(self):
+        return self.STATE_NAMES[np.argmax(self.p)]
 
     def reset(self) -> None:
-        """Reset bufferu (při přechodu na nové video nebo ztrátu osoby)."""
-        self._angle_buf.clear()
-        self.last_is_flip        = False
-        self.last_flip_prob      = 0.0
-        self.last_dominant_state = "IDLE"
-        self.last_states         = []
+        """Reset stavu filtru (nové video nebo ztráta osoby)."""
+        self.last_angle = None
+        self.p[:] = [0.98, 0.01, 0.01]

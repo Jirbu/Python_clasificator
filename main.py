@@ -38,7 +38,7 @@ from visualizer import Visualizer
 from jump_detector import JumpDetector
 from flip_detector import FlipDetector
 from person_manager import PersonManager
-from torso_angle import compute_torso_angle, compute_torso_angle_debug, FREERUN_ANGLE_THR
+from torso_angle import compute_torso_angle, compute_torso_angle_debug, FREERUN_ANGLE_THR, torso_deviation
 
 # ── Konfigurace loggeru ───────────────────────────────────────────────────────
 logging.basicConfig(
