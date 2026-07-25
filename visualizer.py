@@ -31,7 +31,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from torso_angle import FREERUN_ANGLE_THR
+from torso_angle import FREERUN_ANGLE_THR, torso_deviation
 
 # ── Skeletal connections (MediaPipe Pose, 33 landmarks) ───────────────────────
 POSE_CONNECTIONS = [
@@ -179,6 +179,7 @@ class Visualizer:
         jump_detector=None,
         torso_angle: float | None = None,
         freerun: bool = False,
+        hmm_flip: bool = False,
     ) -> None:
         """
         Nakreslí všechny overlays a zapíše snímek do videa.
@@ -213,7 +214,7 @@ class Visualizer:
                 self._draw_jump_trajectory(vis, traj, p1)
 
         # Globální panel (vpravo nahoře)
-        self._draw_global_panel(vis, action, timestamp_ms, current_fps, p1, freerun=freerun)
+        self._draw_global_panel(vis, action, timestamp_ms, current_fps, p1, freerun=freerun, hmm_flip=hmm_flip)
 
         # HIGH RES badge (levý dolní roh) – zobrazí se pokud byl použit hires fallback
         if p1 is not None and p1.get("pipeline_used") == "crop_hires":
@@ -268,10 +269,11 @@ class Visualizer:
 
         h, w = frame.shape[:2]
 
-        hip_xy       = traj["hip_xy"]       # list[(x_norm, y_norm)]
-        y_corr       = traj["y_corrected"]  # list[float]
-        t_norm       = traj["t_norm"]       # list[float] 0..1
-        parabola_abc = traj.get("parabola_abc")
+        hip_xy        = traj["hip_xy"]        # list[(x_norm, y_norm)]
+        y_corr        = traj["y_corrected"]   # list[float]
+        t_norm        = traj["t_norm"]        # list[float] 0..1
+        parabola_abc  = traj.get("parabola_abc")
+        excluded_count = traj.get("excluded_count", 0)  # počet nejstarších bodů vyřazených z fitu
         n            = len(hip_xy)
 
         if n == 0:
@@ -283,9 +285,9 @@ class Visualizer:
 
         # ── Mřížka: anchor = 80px vpravo od aktuálního hip ─────────────────
         GRID_OFFSET_X  = 80          # px od hip ke kraji mřížky
-        GRID_W         = 5 * 28      # 5 sloupců × 28 px
+        GRID_W         = 6 * 28      # 6 sloupců × 28 px
         GRID_H         = 120         # výška mřížky v px
-        GRID_COLS      = 5           # počet časových sloupců
+        GRID_COLS      = 6           # počet časových sloupců (odpovídá buffer_size=6)
         GRID_ROWS      = 4           # počet horizontálních referenčních čar
 
         gx0 = cur_hip_x + GRID_OFFSET_X
@@ -344,16 +346,20 @@ class Visualizer:
             mx = col_xs[col_idx]
             my = map_y(y_corr[i])
 
-            # Horizontální spojovací čára (tenká, modrá)
-            cv2.line(frame, (ox, oy), (mx, my), (200, 120, 30), 1)
+            # Barva: červená pro body vyřazené z fitu (nejstarší excluded_count bodů)
+            is_excluded = (i < excluded_count)
+            dot_color    = (0, 0, 220)   if is_excluded else (120 + int(135 * (i / max(n - 1, 1))), 80, 30)
+            mirror_color = (0, 0, 220)   if is_excluded else (230, 230, 230)
+            line_color   = (0, 0, 180)   if is_excluded else (200, 120, 30)
 
-            # Modrý kruh na skutečné pozici
-            alpha_val = 120 + int(135 * (i / max(n - 1, 1)))  # starší = průhledněj
-            color_blue = (alpha_val, 80, 30)   # BGR: modrá s tmaváním pro starší
-            cv2.circle(frame, (ox, oy), 5, color_blue, -1)
+            # Horizontální spojovací čára
+            cv2.line(frame, (ox, oy), (mx, my), line_color, 1)
 
-            # Zrcadlový bod (bílý)
-            cv2.circle(frame, (mx, my), 4, (230, 230, 230), -1)
+            # Kruh na skutečné pozici
+            cv2.circle(frame, (ox, oy), 5, dot_color, -1)
+
+            # Zrcadlový bod v mřížce
+            cv2.circle(frame, (mx, my), 4, mirror_color, -1)
 
     # ── Per-osoba ─────────────────────────────────────────────────────────────
 
@@ -665,7 +671,7 @@ class Visualizer:
         ]
         # Torso angle řádek
         if torso_angle is not None:
-            angle_color = (0, 200, 80) if torso_angle > FREERUN_ANGLE_THR else (200, 120, 30)
+            angle_color = (0, 200, 80) if torso_deviation(torso_angle) > FREERUN_ANGLE_THR else (200, 120, 30)
             lines.append((f"torso_angle: {torso_angle:.1f}\u00b0", angle_color))
         else:
             lines.append(("torso_angle: n/a", (100, 100, 100)))
@@ -792,6 +798,7 @@ class Visualizer:
         current_fps: float,
         p1: dict | None,
         freerun: bool = False,
+        hmm_flip: bool = False,
     ) -> None:
         """
         Debug panel vpravo nahoře:
@@ -806,7 +813,7 @@ class Visualizer:
         valid_pose     = p1.get("valid_pose", False)     if p1 else False
 
         panel_w = 220
-        panel_h = 148
+        panel_h = 168
         px = w - panel_w - 8
         py = 8
         lh = 20
@@ -841,6 +848,14 @@ class Visualizer:
         cv2.putText(frame, "jump_cl: ", (tx, ty), _FONT, _FONT_SM, (200, 200, 200), 1, cv2.LINE_AA)
         lx = tx + cv2.getTextSize("jump_cl: ", _FONT, _FONT_SM, 1)[0][0]
         cv2.putText(frame, jump_cl_text, (lx, ty), _FONT, _FONT_SM, jump_cl_color, 2, cv2.LINE_AA)
+        ty += lh
+
+        # hmm_flip
+        hmm_flip_text  = "TRUE" if hmm_flip else "FALSE"
+        hmm_flip_color = (0, 230, 200) if hmm_flip else (0, 60, 220)
+        cv2.putText(frame, "hmm_flip:", (tx, ty), _FONT, _FONT_SM, (200, 200, 200), 1, cv2.LINE_AA)
+        lx = tx + cv2.getTextSize("hmm_flip:", _FONT, _FONT_SM, 1)[0][0]
+        cv2.putText(frame, hmm_flip_text, (lx, ty), _FONT, _FONT_SM, hmm_flip_color, 2, cv2.LINE_AA)
         ty += lh
 
         # freerun

@@ -33,6 +33,17 @@ _VIS_THR = 0.00
 FREERUN_ANGLE_THR: float = 80.0
 
 
+def torso_deviation(angle_360: float) -> float:
+    """
+    Vrátí odchylku od svislé polohy v rozmezí [0, 180].
+    Funguje správně pro výstup 0–360°:
+        angle=10  →  deviation=10   (mírné naklonění)
+        angle=170 →  deviation=170  (téměř obráceně)
+        angle=350 →  deviation=10   (mírné naklonění na druhou stranu)
+    """
+    return min(angle_360, 360.0 - angle_360)
+
+
 def _mid_or_single(lm: np.ndarray, key_l: str, key_r: str) -> np.ndarray | None:
     """Vrátí střed páru kloubů, nebo jeden pokud druhý není viditelný, nebo None."""
     vl = lm[LANDMARK_INDEX[key_l], 3]
@@ -82,8 +93,9 @@ def compute_torso_angle(lm: np.ndarray) -> float | None:
         return None
 
     axis_norm = axis / length
-    cos_angle = float(np.clip(np.dot(axis_norm, np.array([0.0, -1.0])), -1.0, 1.0))
-    return float(np.degrees(np.arccos(cos_angle)))
+    angle_rad  = np.arctan2(float(axis_norm[0]), float(-axis_norm[1]))
+    angle_deg  = float(np.degrees(angle_rad))
+    return (angle_deg + 360.0) % 360.0
 
 
 def compute_torso_angle_debug(lm: np.ndarray | None) -> tuple[float | None, int]:
@@ -124,5 +136,6 @@ def compute_torso_angle_debug(lm: np.ndarray | None) -> tuple[float | None, int]
         return None, 4
 
     axis_norm = axis / length
-    cos_angle = float(np.clip(np.dot(axis_norm, np.array([0.0, -1.0])), -1.0, 1.0))
-    return float(np.degrees(np.arccos(cos_angle))), 0
+    angle_rad = np.arctan2(float(axis_norm[0]), float(-axis_norm[1]))
+    angle_deg = float(np.degrees(angle_rad))
+    return (angle_deg + 360.0) % 360.0, 0

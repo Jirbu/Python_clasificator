@@ -34,9 +34,20 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_hip_center_y(landmarks: np.ndarray) -> float:
-    """Vrátí Y souřadnici středu boků v normalizovaných souřadnicích."""
+    """Vrátí Y souřadnici středu boků. Fallback na jeden bok pokud druhý není viditelný."""
     I = LANDMARK_INDEX
-    return (float(landmarks[I["left_hip"], 1]) + float(landmarks[I["right_hip"], 1])) / 2.0
+    _VIS = 0.1
+    lv = float(landmarks[I["left_hip"],  3])
+    rv = float(landmarks[I["right_hip"], 3])
+    ly = float(landmarks[I["left_hip"],  1])
+    ry = float(landmarks[I["right_hip"], 1])
+    if lv >= _VIS and rv >= _VIS:
+        return (ly + ry) / 2.0
+    if lv >= _VIS:
+        return ly
+    if rv >= _VIS:
+        return ry
+    return (ly + ry) / 2.0  # oba neviditelní – průměr jako poslední záloha
 
 
 def compute_torso_height(landmarks: np.ndarray) -> float:
@@ -146,10 +157,10 @@ class JumpDetector:
 
     def __init__(
         self,
-        buffer_size: int         = 5,
+        buffer_size: int         = 6,
         amplitude_factor: float  = 0.5,
         min_abs_a: float         = 0.10,
-        max_fit_error: float     = 0.0020,
+        max_fit_error: float     = 0.0040,
         min_monotone_len: int    = 3,
         velocity_factor: float   = 0.15,
         camera_correction: bool  = True,
@@ -178,6 +189,7 @@ class JumpDetector:
         self.last_lin4_err:      float = 0.0
         self.last_fifth_err:     float = 0.0
         self.outlier_err_ratio:  float = 4.0   # fifth_err > ratio * lin4_err → outlier
+        self.last_excluded_count: int  = 0     # počet vyřazených nejstarších bodů z fitu
 
     # ── Platný snímek ────────────────────────────────────────────────────────
 
@@ -272,7 +284,21 @@ class JumpDetector:
         Pracuje pouze s validními body z bufferu.
         Vrátí True pouze pokud VŠECHNY vrstvy projdou.
         """
-        pts     = [e for e in buf if e["valid"]]
+        # Všechny validní body z bufferu
+        pts_all = [e for e in buf if e["valid"]]
+        pts     = pts_all
+
+        # Vyřaď nejstarší vzorky pokud je osoba výše (menší y) než na následujícím:
+        # 6. slot výše než 5. → zahoď; pak pokud 5. slot výše než 4. → zahoď i ten.
+        excluded = 0
+        if len(pts) >= 2 and pts[0]["y_corrected"] < pts[1]["y_corrected"]:
+            pts = pts[1:]
+            excluded = 1
+            if len(pts) >= 2 and pts[0]["y_corrected"] < pts[1]["y_corrected"]:
+                pts = pts[1:]
+                excluded = 2
+        self.last_excluded_count = excluded
+
         t_arr   = np.array([p["t_sec"]       for p in pts], dtype=np.float64)
         y_arr   = np.array([p["y_corrected"] for p in pts], dtype=np.float64)
         torso_h = float(np.median([p["torso_h"] for p in pts]))
@@ -306,35 +332,39 @@ class JumpDetector:
         if abs(a) < self.min_abs_a:
             self.last_fail_reason = "curve"
             return False
+        if a < 0:
+            # a < 0 → parabola má maximum y uprostřed = fyzická výška má minimum
+            # (osoba šla dolů pak nahoru) → neodpovídá výskovému oblouku, zamítnout.
+            self.last_fail_reason = "convex"
+            return False
         if mse > self.max_fit_error:
             self.last_fail_reason = "fit"
             return False
 
-        # ── L3: Outlier fit – poslední bod vs lineární fit prvních N-1 ──
+        # ── L3: Outlier fit – deaktivováno ──────────────────────────────
+        # Při rotačních prvcích (přemety, salta) může rotace krátkodobě
+        # kompenzovat parabolický nábeh, což způsobovalo falešné zamítnutí
+        # jinak validních skoků. Outlier detekce proto vypnuta.
         self.last_lin4_err  = 0.0
         self.last_fifth_err = 0.0
-        if len(t_norm) >= 3:
-            t_head = t_norm[:-1]
-            y_head = y_arr[:-1]
-            # Outlier check má smysl jen pokud máme dost bodů pro spolehlivý
-            # lineární fit – s méně než 3 body je fit vždy (téměř) dokonalý
-            # a lin4_err ≈ 0, takže by check nesprávně prošel nebo zamítl.
-            if len(t_head) >= 3:
-                try:
-                    lin_coeffs = np.polyfit(t_head, y_head, 1)
-                    y_head_fit  = np.polyval(lin_coeffs, t_head)
-                    lin4_err    = float(np.mean(np.abs(y_head - y_head_fit)))
-                    fifth_err   = float(abs(y_arr[-1] - np.polyval(lin_coeffs, t_norm[-1])))
-                    self.last_lin4_err  = lin4_err
-                    self.last_fifth_err = fifth_err
-                    if lin4_err > 1e-6 and fifth_err > 10.0 * lin4_err:
-                        # Extrémní outlier → označíme poslední bod jako nevalidní
-                        self._buffer[-1]["valid"] = False
-                    if lin4_err > 1e-6 and fifth_err > self.outlier_err_ratio * lin4_err:
-                        self.last_fail_reason = "outlier"
-                        return False
-                except (np.linalg.LinAlgError, ValueError):
-                    pass
+        # if len(t_norm) >= 3:
+        #     t_head = t_norm[:-1]
+        #     y_head = y_arr[:-1]
+        #     if len(t_head) >= 3:
+        #         try:
+        #             lin_coeffs = np.polyfit(t_head, y_head, 1)
+        #             y_head_fit  = np.polyval(lin_coeffs, t_head)
+        #             lin4_err    = float(np.mean(np.abs(y_head - y_head_fit)))
+        #             fifth_err   = float(abs(y_arr[-1] - np.polyval(lin_coeffs, t_norm[-1])))
+        #             self.last_lin4_err  = lin4_err
+        #             self.last_fifth_err = fifth_err
+        #             if lin4_err > 1e-6 and fifth_err > 10.0 * lin4_err:
+        #                 self._buffer[-1]["valid"] = False
+        #             if lin4_err > 1e-6 and fifth_err > self.outlier_err_ratio * lin4_err:
+        #                 self.last_fail_reason = "outlier"
+        #                 return False
+        #         except (np.linalg.LinAlgError, ValueError):
+        #             pass
 
         # ── L4: Minimální rychlost ───────────────────────────────────────
         dy = np.diff(y_arr)
@@ -409,24 +439,36 @@ class JumpDetector:
         if n < 2:
             return None
 
-        hip_xy      = [(e["hip_x"], e["hip_y"]) for e in buf if e["valid"]]
-        y_corrected = [e["y_corrected"] for e in buf if e["valid"]]
-        t_norm      = [i / (len(hip_xy) - 1) if len(hip_xy) > 1 else 0.0 for i in range(len(hip_xy))]
+        buf_size = self._buffer.maxlen or n
+        valid_entries = [(idx, e) for idx, e in enumerate(buf) if e["valid"]]
+        hip_xy      = [(e["hip_x"], e["hip_y"]) for _, e in valid_entries]
+        y_corrected = [e["y_corrected"] for _, e in valid_entries]
+        # t_norm podle pozice v bufferu (0=nejstarší slot, 1=nejnovější slot)
+        # → nejnovější bod je vždy v pravém sloupci mřížky
+        t_norm = [idx / (buf_size - 1) for idx, _ in valid_entries]
 
+        # Parabola: stejný pre-jump filtr jako v _analyse_trajectory
+        # → vyloučené body (červené) skutečně do fitu nevstupují
         parabola_abc: tuple[float, float, float] | None = None
-        try:
-            import numpy as np
-            coeffs = np.polyfit(t_norm, y_corrected, 2)
-            parabola_abc = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]))
-        except Exception:
-            pass
+        excluded = self.last_excluded_count
+        fit_entries = valid_entries[excluded:]   # přeskaž excluded nejstarších
+        if len(fit_entries) >= 3:
+            try:
+                t_fit = [idx / (buf_size - 1) for idx, _ in fit_entries]
+                y_fit = [e["y_corrected"] for _, e in fit_entries]
+                coeffs = np.polyfit(t_fit, y_fit, 2)
+                a_viz = float(coeffs[0])
+                parabola_abc = (a_viz, float(coeffs[1]), float(coeffs[2]))
+            except Exception:
+                pass
 
         return {
-            "hip_xy":       hip_xy,
-            "y_corrected":  y_corrected,
-            "t_norm":       t_norm,
-            "parabola_abc": parabola_abc,
-            "is_jump":      self.last_is_jump,
+            "hip_xy":        hip_xy,
+            "y_corrected":   y_corrected,
+            "t_norm":        t_norm,
+            "parabola_abc":  parabola_abc,
+            "is_jump":       self.last_is_jump,
+            "excluded_count": self.last_excluded_count,
         }
 
     # ── Snapshot / Restore ─────────────────────────────────────────────────
