@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(py \"C:\\\\Users\\\\JIRKA_~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Jirka-Pracovni-Vyvoj-appka-python-algoritmus\\\\0b5496a5-65b4-4bb5-b289-2f076dcca743\\\\scratchpad\\\\debug_flip7.py\")",
+      "PowerShell(py \"C:\\\\Users\\\\JIRKA_~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Jirka-Pracovni-Vyvoj-appka-python-algoritmus\\\\0b5496a5-65b4-4bb5-b289-2f076dcca743\\\\scratchpad\\\\debug_flip8.py\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('flip_detector.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python main.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}

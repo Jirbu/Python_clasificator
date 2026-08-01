@@ -98,6 +98,61 @@ def compute_torso_angle(lm: np.ndarray) -> float | None:
     return (angle_deg + 360.0) % 360.0
 
 
+def _mid_or_single_conf(lm: np.ndarray, key_l: str, key_r: str) -> tuple[np.ndarray | None, float]:
+    """Jako _mid_or_single, navíc vrací confidence (průměr použitých visibility)."""
+    vl = float(lm[LANDMARK_INDEX[key_l], 3])
+    vr = float(lm[LANDMARK_INDEX[key_r], 3])
+    pl = lm[LANDMARK_INDEX[key_l], :2]
+    pr = lm[LANDMARK_INDEX[key_r], :2]
+    if vl >= _VIS_THR and vr >= _VIS_THR:
+        return (pl + pr) / 2.0, (vl + vr) / 2.0
+    if vl >= _VIS_THR:
+        return pl.copy(), vl
+    if vr >= _VIS_THR:
+        return pr.copy(), vr
+    return None, 0.0
+
+
+def compute_torso_angle_full(lm: np.ndarray | None) -> tuple[float | None, float, int]:
+    """
+    Jako compute_torso_angle_debug, ale navíc vrací confidence [0, 1] odvozenou
+    z visibility skóre landmarků skutečně použitých pro výpočet úhlu.
+
+    Vrací: (angle_deg | None, confidence, rejection_code)
+    """
+    if lm is None:
+        return None, 0.0, 1
+
+    nose_vis = float(lm[LANDMARK_INDEX["nose"], 3])
+    nose_xy  = lm[LANDMARK_INDEX["nose"], :2] if nose_vis >= _VIS_THR else None
+
+    hip_pt,      hip_conf      = _mid_or_single_conf(lm, "left_hip",      "right_hip")
+    shoulder_pt, shoulder_conf = _mid_or_single_conf(lm, "left_shoulder", "right_shoulder")
+
+    if nose_xy is not None:
+        if hip_pt is not None:
+            base, top, conf = hip_pt, nose_xy, min(hip_conf, max(nose_vis, 0.0))
+        elif shoulder_pt is not None:
+            base, top, conf = shoulder_pt, nose_xy, min(shoulder_conf, max(nose_vis, 0.0))
+        else:
+            return None, 0.0, 2
+    else:
+        if hip_pt is not None and shoulder_pt is not None:
+            base, top, conf = hip_pt, shoulder_pt, min(hip_conf, shoulder_conf)
+        else:
+            return None, 0.0, 3
+
+    axis = top - base
+    length = float(np.linalg.norm(axis))
+    if length < 1e-6:
+        return None, 0.0, 4
+
+    axis_norm = axis / length
+    angle_rad = np.arctan2(float(axis_norm[0]), float(-axis_norm[1]))
+    angle_deg = float(np.degrees(angle_rad))
+    return (angle_deg + 360.0) % 360.0, float(min(max(conf, 0.0), 1.0)), 0
+
+
 def compute_torso_angle_debug(lm: np.ndarray | None) -> tuple[float | None, int]:
     """
     Stejné jako compute_torso_angle, ale navíc vrací kód zamítnutí:

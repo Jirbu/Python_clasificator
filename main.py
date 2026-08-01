@@ -38,7 +38,7 @@ from visualizer import Visualizer
 from jump_detector import JumpDetector
 from flip_detector import FlipDetector
 from person_manager import PersonManager
-from torso_angle import compute_torso_angle, compute_torso_angle_debug, FREERUN_ANGLE_THR, torso_deviation
+from torso_angle import compute_torso_angle, compute_torso_angle_debug, compute_torso_angle_full, FREERUN_ANGLE_THR, torso_deviation
 
 # ── Konfigurace loggeru ───────────────────────────────────────────────────────
 logging.basicConfig(
@@ -254,6 +254,8 @@ def process_video(
                 # Pokud osoba není přítomna → zapsat debug a přeskočit klasifikaci
                 if not person_present:
                     jump_detector.update_missing(timestamp_ms)
+                    hmm_flip_prob = flip_detector.update(None, 0.0, timestamp_ms)
+                    hmm_flip = hmm_flip_prob > 0.85
                     frame_rows.append({
                         "timestamp_ms": f"{timestamp_ms:.0f}",
                         "debug_ms":     f"{_debug_ms:.0f}",
@@ -261,6 +263,8 @@ def process_video(
                         "backup":       0,
                         "action":       "",
                         "is_acrobatic": False,
+                        "hmm_flip":     hmm_flip,
+                        "hmm_flip_prob": round(hmm_flip_prob, 3),
                     })
                     _jbuf_w = list(jump_detector._buffer)
                     _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
@@ -276,6 +280,8 @@ def process_video(
                 # Ghost frame: tracker říká present, ale nejsou platná landmarks
                 if not valid_pose or landmarks is None:
                     jump_detector.update_missing(timestamp_ms)
+                    hmm_flip_prob = flip_detector.update(None, 0.0, timestamp_ms)
+                    hmm_flip = hmm_flip_prob > 0.85
                     frame_rows.append({
                         "timestamp_ms": f"{timestamp_ms:.0f}",
                         "debug_ms":     f"{_debug_ms:.0f}",
@@ -283,6 +289,8 @@ def process_video(
                         "backup":       0,
                         "action":       "",
                         "is_acrobatic": False,
+                        "hmm_flip":     hmm_flip,
+                        "hmm_flip_prob": round(hmm_flip_prob, 3),
                     })
                     _jbuf_w = list(jump_detector._buffer)
                     _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
@@ -311,9 +319,10 @@ def process_video(
                 else:
                     physics_is_jump = jump_detector.update(frame, landmarks, timestamp_ms)
 
-                # HMM flip detektor – aktualizace torso úhlem
-                _ta_for_flip, _ = compute_torso_angle_debug(r0.get("_raw_lm"))
-                hmm_flip = flip_detector.update(_ta_for_flip)
+                # Flip detektor (Kalman) – aktualizace torso úhlem + confidence
+                _ta_for_flip, _ta_conf_for_flip, _ = compute_torso_angle_full(r0.get("_raw_lm"))
+                hmm_flip_prob = flip_detector.update(_ta_for_flip, _ta_conf_for_flip, timestamp_ms)
+                hmm_flip = hmm_flip_prob > 0.85
 
                 # Naplnění temporálního okna
                 # Enkóduj backup level + trigger do jediného CSV čísla:
@@ -345,6 +354,7 @@ def process_video(
                         "is_acrobatic": False,
                         "freerun":      _freerun_warmup,
                         "hmm_flip":     hmm_flip,
+                        "hmm_flip_prob": round(hmm_flip_prob, 3),
                     })
                     _jbuf_w = list(jump_detector._buffer)
                     _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
@@ -361,7 +371,7 @@ def process_video(
                             jump_detector=jump_detector,
                             torso_angle=_ta_warmup,
                             freerun=_freerun_warmup,
-                            hmm_flip=hmm_flip,
+                            hmm_flip=hmm_flip_prob,
                         )
                     continue
 
@@ -397,6 +407,7 @@ def process_video(
                     "is_acrobatic": is_acrobatic,
                     "freerun":      freerun,
                     "hmm_flip":     hmm_flip,
+                    "hmm_flip_prob": round(hmm_flip_prob, 3),
                 })
                 rows_written += 1
 
@@ -419,7 +430,7 @@ def process_video(
                         jump_detector=jump_detector,
                         torso_angle=torso_angle,
                         freerun=freerun,
-                        hmm_flip=hmm_flip,
+                        hmm_flip=hmm_flip_prob,
                     )
 
     finally:
@@ -440,15 +451,49 @@ def process_video(
         rows_written, frames_no_pose, frames_invalid, elapsed,
     )
 
-    # ── Post-processing: highlight ────────────────────────────────────────────
+    # ── Post-processing: zarovnání hmm_flip ───────────────────────────────────
+    # flip_detector.update() vrací hodnotu zpožděnou o lookahead_frames snímků
+    # (pseudo-online lookahead buffer), takže patří snímku o `lag` řádků zpět,
+    # ne aktuálnímu řádku, na který se zapsala za běhu. Poslední `lag` řádků
+    # nemá k dispozici vyřešenou budoucí hodnotu – zůstane jim poslední známá.
+    lag = flip_detector.lookahead_frames
+    if 0 < lag < len(frame_rows):
+        hmm_flip_vals      = [row["hmm_flip"] for row in frame_rows]
+        hmm_flip_prob_vals = [row["hmm_flip_prob"] for row in frame_rows]
+        n = len(frame_rows)
+        for i in range(n - lag):
+            frame_rows[i]["hmm_flip"]      = hmm_flip_vals[i + lag]
+            frame_rows[i]["hmm_flip_prob"] = hmm_flip_prob_vals[i + lag]
+
+    # ── Post-processing: flip_window – zpětné označení snímků rotace ─────────
+    # hmm_flip se aktivuje až po nahromadění dostatečné rotace, takže samotný
+    # náběh (prvních pár desítek stupňů rotace) mu unikne – proto se vzestupná
+    # hrana zpětně promítne na FLIP_BACKFILL_FRAMES předchozích snímků.
+    # Celé plató hmm_flip=True (ne jen náběh) se počítá taky – proti dopřednému
+    # "doznívání" do snímků bez platné pózy (osoba mimo záběr při dopadu) chrání
+    # už samotné is_jump, které je v takových snímcích napevno False.
+    FLIP_BACKFILL_FRAMES = 4
+    for row in frame_rows:
+        row["flip_window"] = bool(row["hmm_flip"])
+    for i, row in enumerate(frame_rows):
+        prev_flip = frame_rows[i - 1]["hmm_flip"] if i > 0 else False
+        if row["hmm_flip"] and not prev_flip:
+            for j in range(max(0, i - FLIP_BACKFILL_FRAMES), i + 1):
+                frame_rows[j]["flip_window"] = True
+
+    # ── Post-processing: freerun + highlight ──────────────────────────────────
+    # freerun = fyzicky ve vzduchu A probíhá (zpětně označená) rotace –
+    # nahrazuje dřívější okamžitý test torso_deviation > FREERUN_ANGLE_THR,
+    # který je náchylný na šum jednoho snímku.
     # highlight = (is_acrobatic AND is_jump) OR freerun
     for row in frame_rows:
-        row["highlight"] = (row["is_acrobatic"] and row["is_jump"]) or row.get("freerun", False)
+        row["freerun"] = bool(row.get("is_jump", False)) and row["flip_window"]
+        row["highlight"] = row.get("freerun", False)
 
     # Zápis do CSV
     with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
         w = csv.writer(csv_file)
-        w.writerow(["timestamp_ms", "debug_ms", "highlight", "is_jump", "freerun", "hmm_flip", "backup", "action"])
+        w.writerow(["timestamp_ms", "debug_ms", "highlight", "is_jump", "freerun", "hmm_flip", "hmm_flip_prob", "flip_window", "backup", "action"])
         for row in frame_rows:
             w.writerow([
                 row["timestamp_ms"],
@@ -457,6 +502,8 @@ def process_video(
                 str(row["is_jump"]),
                 str(row.get("freerun", False)),
                 str(row.get("hmm_flip", False)),
+                row.get("hmm_flip_prob", 0.0),
+                str(row.get("flip_window", False)),
                 str(row["backup"]),
                 row["action"],
             ])

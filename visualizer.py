@@ -179,7 +179,7 @@ class Visualizer:
         jump_detector=None,
         torso_angle: float | None = None,
         freerun: bool = False,
-        hmm_flip: bool = False,
+        hmm_flip: float = 0.0,
     ) -> None:
         """
         Nakreslí všechny overlays a zapíše snímek do videa.
@@ -851,8 +851,8 @@ class Visualizer:
         ty += lh
 
         # hmm_flip
-        hmm_flip_text  = "TRUE" if hmm_flip else "FALSE"
-        hmm_flip_color = (0, 230, 200) if hmm_flip else (0, 60, 220)
+        hmm_flip_text  = f"{hmm_flip:.2f}"
+        hmm_flip_color = (0, 230, 200) if hmm_flip > 0.85 else (0, 60, 220)
         cv2.putText(frame, "hmm_flip:", (tx, ty), _FONT, _FONT_SM, (200, 200, 200), 1, cv2.LINE_AA)
         lx = tx + cv2.getTextSize("hmm_flip:", _FONT, _FONT_SM, 1)[0][0]
         cv2.putText(frame, hmm_flip_text, (lx, ty), _FONT, _FONT_SM, hmm_flip_color, 2, cv2.LINE_AA)
