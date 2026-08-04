@@ -160,10 +160,11 @@ def process_video(
     _yolo_video, _yolo_image = create_pose_detectors(
         min_detection_confidence=0.5, min_tracking_confidence=0.45, min_confidence=0.5,
     )
-    pose_backends.POSE_MODEL = "mediapipe"
-    _mp_video, _mp_image = create_pose_detectors(
-        min_detection_confidence=0.5, min_tracking_confidence=0.45, min_confidence=0.5,
-    )
+    # MediaPipe se načítá LÍNĚ – teprve při první skutečné potřebě přepnout
+    # (scéna se přiblíží). Video, které nikdy nepřepne (jako IMG_6497), tak
+    # nezaplatí ani startovní náklad na jeho načtení.
+    _mp_video: object | None = None
+    _mp_image: object | None = None
     _SCALE_CLOSE_LO    = 0.35
     _SCALE_CLOSE_HI    = 0.50
     _SCALE_WINDOW_SIZE = 7
@@ -172,7 +173,17 @@ def process_video(
     pose_backends.POSE_MODEL = active_pose_model
 
     def _backend_pair(model: str):
-        return (_mp_video, _mp_image) if model == "mediapipe" else (_yolo_video, _yolo_image)
+        nonlocal _mp_video, _mp_image
+        if model == "mediapipe":
+            if _mp_video is None:
+                _saved = pose_backends.POSE_MODEL
+                pose_backends.POSE_MODEL = "mediapipe"
+                _mp_video, _mp_image = create_pose_detectors(
+                    min_detection_confidence=0.5, min_tracking_confidence=0.45, min_confidence=0.5,
+                )
+                pose_backends.POSE_MODEL = _saved
+            return (_mp_video, _mp_image)
+        return (_yolo_video, _yolo_image)
 
     def _bbox_frac(landmarks, frame_shape) -> float | None:
         """max(šířka, výška) bbox viditelných klíčových bodů / výška obrazu."""
@@ -574,9 +585,9 @@ def process_video(
                     )
 
     finally:
-        # Oba páry (mediapipe i yolov8) byly načtené najednou kvůli scale-
-        # adaptivnímu přepínání – uzavřít je třeba oba, ne jen aktuálně aktivní.
-        _mp_video.close()
+        # mediapipe pár se zavírá jen pokud byl (líně) skutečně načten.
+        if _mp_video is not None:
+            _mp_video.close()
         _yolo_video.close()
         multi_manager.log_stats()
         multi_manager.reset()
