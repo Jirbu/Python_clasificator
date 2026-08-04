@@ -22,23 +22,26 @@ Spuštění:
 """
 
 import argparse
+import contextlib
 import csv
 import logging
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
+import pose_backends
 from video_loader import VideoLoader, get_video_files
-from pose_detector import PoseDetector, PoseDetectorImage
+from pose_backends import create_pose_detectors
 from feature_extractor import FeatureExtractor
 from temporal_model import TemporalWindow
 from classifier import ActionClassifier
 from visualizer import Visualizer
 from jump_detector import JumpDetector
-from flip_detector import FlipDetector
+from flip_detector import FlipDetector, CoverageFlipDetector
 from person_manager import PersonManager
-from torso_angle import compute_torso_angle, compute_torso_angle_debug, compute_torso_angle_full, FREERUN_ANGLE_THR, torso_deviation
+from torso_angle import compute_torso_angle, compute_torso_angle_debug, compute_torso_angle_full, FREERUN_ANGLE_THR, torso_deviation, LANDMARK_INDEX
 
 # ── Konfigurace loggeru ───────────────────────────────────────────────────────
 logging.basicConfig(
@@ -52,6 +55,55 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # ZPRACOVÁNÍ JEDNOHO VIDEA
 # ─────────────────────────────────────────────────────────────────────────────
+
+class _NullWriter:
+    """No-op náhrada za csv.writer – použita mimo --debug, aby se diagnostické
+    CSV vůbec nezapisovaly (ušetří I/O při měření realtime výkonu)."""
+    def writerow(self, row) -> None:
+        pass
+
+
+def _build_full_clusters(
+    timestamps: list[float], target_fps: int, gap_ms: float = 3000.0, expand_frames: int = 2,
+) -> list[tuple[float, float]]:
+    """
+    Seskupí seřazené timestampy do clusterů: sousední časy patří do stejného
+    clusteru, pokud je mezera mezi nimi <= gap_ms. Výsledná hranice clusteru se
+    pak rozšíří o `expand_frames` snímků (dle target_fps) před první a za
+    poslední hranici – to je "full_cluster".
+
+    Vrací seznam (full_start_ms, full_end_ms) seřazený vzestupně.
+    """
+    if not timestamps:
+        return []
+    ts_sorted = sorted(timestamps)
+    clusters: list[list[float]] = [[ts_sorted[0]]]
+    for t in ts_sorted[1:]:
+        if t - clusters[-1][-1] <= gap_ms:
+            clusters[-1].append(t)
+        else:
+            clusters.append([t])
+
+    frame_interval_ms = 1000.0 / target_fps
+    pad = expand_frames * frame_interval_ms
+    return [(c[0] - pad, c[-1] + pad) for c in clusters]
+
+
+def _fmt_ms(ms: float) -> str:
+    secs = ms / 1000.0
+    mins = int(secs // 60)
+    return f"{mins:02d}:{secs % 60:06.3f} ({ms:.0f} ms)"
+
+
+def _print_full_clusters(name: str, timestamps: list[float], target_fps: int) -> None:
+    clusters = _build_full_clusters(timestamps, target_fps)
+    if clusters:
+        print(f"\n{name} – FULL_CLUSTERY ({len(clusters)}):")
+        for i, (start, end) in enumerate(clusters, 1):
+            print(f"  #{i}: {_fmt_ms(start)}  →  {_fmt_ms(end)}")
+    else:
+        print(f"\n{name} – FULL_CLUSTERY: žádné")
+
 
 def _pipe_stage_label(stage: str) -> str:
     """Převede interní název stage na zkratku dle specifikace pipeline."""
@@ -96,9 +148,45 @@ def process_video(
     logger.info("── Zpracovávám: %s", video_name)
     t_start = time.time()
 
-    # Detektory pózy
-    pose_detector  = PoseDetector(min_detection_confidence=0.5, min_tracking_confidence=0.45)   # VIDEO mode: Person 1 TRACKING (full frame)
-    image_detector = PoseDetectorImage(min_confidence=0.5)   # IMAGE mode: Person 1 LOST crop + Person 2 + scan
+    # Detektory pózy – scale-adaptivní přepínání MediaPipe/YOLOv8 podle toho,
+    # jak blízko kamery je sledovaná osoba (bbox_frac = max rozměr bbox osoby /
+    # výška obrazu). Blízko kamery → MediaPipe (přesnější i rychlejší nablízko,
+    # ověřeno: 5/5 referencí, 52 % reálného času). Daleko → YOLOv8 (přesnější na
+    # malé/vzdálené postavy, ověřeno: 9/9 referencí přes cov_flip_prob).
+    # Kalibrováno na dvou referenčních videích: IMG_6497 (daleko) bbox_frac
+    # max ~0.30, testovaci_1 (blízko, špička v okamžiku skoku) ~0.72 – hystereze
+    # 0.35/0.50 dává bezpečnou rezervu k oběma stranám.
+    pose_backends.POSE_MODEL = "yolov8"
+    _yolo_video, _yolo_image = create_pose_detectors(
+        min_detection_confidence=0.5, min_tracking_confidence=0.45, min_confidence=0.5,
+    )
+    pose_backends.POSE_MODEL = "mediapipe"
+    _mp_video, _mp_image = create_pose_detectors(
+        min_detection_confidence=0.5, min_tracking_confidence=0.45, min_confidence=0.5,
+    )
+    _SCALE_CLOSE_LO    = 0.35
+    _SCALE_CLOSE_HI    = 0.50
+    _SCALE_WINDOW_SIZE = 7
+    _scale_window: deque[float] = deque(maxlen=_SCALE_WINDOW_SIZE)
+    active_pose_model = "yolov8"   # výchozí – obecnější/vzdálenější scéna
+    pose_backends.POSE_MODEL = active_pose_model
+
+    def _backend_pair(model: str):
+        return (_mp_video, _mp_image) if model == "mediapipe" else (_yolo_video, _yolo_image)
+
+    def _bbox_frac(landmarks, frame_shape) -> float | None:
+        """max(šířka, výška) bbox viditelných klíčových bodů / výška obrazu."""
+        if landmarks is None:
+            return None
+        vis_mask = landmarks[:, 3] > 0.5
+        if vis_mask.sum() < 4:
+            return None
+        frame_h, frame_w = frame_shape[0], frame_shape[1]
+        xs = landmarks[vis_mask, 0] * frame_w
+        ys = landmarks[vis_mask, 1] * frame_h
+        return float(max(xs.max() - xs.min(), ys.max() - ys.min()) / frame_h)
+
+    pose_detector, image_detector = _backend_pair(active_pose_model)
 
     # Multi-person koordinátor
     multi_manager = PersonManager()
@@ -109,9 +197,12 @@ def process_video(
     classifier        = ActionClassifier(model_path=model_path)
     jump_detector     = JumpDetector()
     flip_detector     = FlipDetector()
+    coverage_detector = CoverageFlipDetector()
 
     rows_written      = 0
     highlight_timestamps: list[float] = []
+    acrobe_timestamps: list[float] = []
+    skok_timestamps: list[float] = []
     frames_processed = 0
     frames_no_pose   = 0
     frames_invalid   = 0
@@ -139,12 +230,17 @@ def process_video(
         pipe_csv_path = output_path.replace(".csv", "_pipeline_debug.csv")
         jbuff_csv_path = output_path.replace(".csv", "_jump_buff.csv")
         torso_csv_path = output_path.replace(".csv", "_torso_debug.csv")
+        # Diagnostické CSV (pipeline_debug/jump_buff/torso_debug) se otevírají a
+        # zapisují jen v --debug módu – v realtime/produkčním běhu jde o zbytečný I/O.
+        _pipe_cm  = open(pipe_csv_path, "w", newline="", encoding="utf-8") if debug else contextlib.nullcontext()
+        _jbuff_cm = open(jbuff_csv_path, "w", newline="", encoding="utf-8") if debug else contextlib.nullcontext()
+        _torso_cm = open(torso_csv_path, "w", newline="", encoding="utf-8") if debug else contextlib.nullcontext()
         with (
             VideoLoader(video_path, target_fps=target_fps) as loader,
             open(output_path, "w", newline="", encoding="utf-8") as csv_file,
-            open(pipe_csv_path, "w", newline="", encoding="utf-8") as pipe_csv_file,
-            open(jbuff_csv_path, "w", newline="", encoding="utf-8") as jbuff_file,
-            open(torso_csv_path, "w", newline="", encoding="utf-8") as torso_csv_file,
+            _pipe_cm as pipe_csv_file,
+            _jbuff_cm as jbuff_file,
+            _torso_cm as torso_csv_file,
         ):
             info = loader.get_video_info()
             logger.info(
@@ -166,25 +262,31 @@ def process_video(
             writer = csv.writer(csv_file)
             # CSV hlavička bude zapsána při post-processingu na konci
 
-            pipe_writer = csv.writer(pipe_csv_file)
+            pipe_writer = csv.writer(pipe_csv_file) if debug else _NullWriter()
             pipe_writer.writerow([
                 "time",
                 "cropframe", "cropframe_num", "cropframe_ref",
                 "fullframe", "fullframe_num", "fullframe_ref",
             ])
 
-            jbuff_writer = csv.writer(jbuff_file)
+            jbuff_writer = csv.writer(jbuff_file) if debug else _NullWriter()
             # Sloupce: timestamp_ms, debug_ms, buf_1 (nejnovější) .. buf_5 (nejstarší)
             # debug_ms = čas v ms který zobrazuje přehrávač debug videa (= pořadí snímku / target_fps)
             jbuff_writer.writerow(["timestamp_ms", "debug_ms", "buf_1", "buf_2", "buf_3", "buf_4", "buf_5", "buf_6"])
 
-            torso_writer = csv.writer(torso_csv_file)
+            torso_writer = csv.writer(torso_csv_file) if debug else _NullWriter()
             # rejection_code: 0=OK, 1=lm None, 2=nos viditelný/žádný kloub, 3=nos neviditelný/chybí kyčle nebo ramena, 4=nulová osa
             #                 5=osoba není přítomna (person_present=False), 6=ghost/neplatná poze
             torso_writer.writerow(["timestamp_ms", "torso_angle", "rejection_code"])
 
             # ── Hlavní smyčka ─────────────────────────────────────────────
-            for timestamp_ms, frame, prev_frame in loader.frame_generator():
+            for timestamp_ms, frame, prev_frame, pending_before, is_regular in loader.frame_generator():
+                if not is_regular:
+                    # Extra snímek by sem dorazil jen po loader.request_densify() (aktuálně
+                    # nikde nevoláno – viz poznámka u _densify_trigger níže). Ponecháno beze
+                    # zpracování, aby přesně odpovídalo původnímu chování (frame skip).
+                    continue
+
                 frames_processed += 1
                 # Pořadí snímku v debug videu (0-based) + čas který ukáže přehrávač
                 _debug_frame_idx = frames_processed - 1
@@ -203,10 +305,28 @@ def process_video(
                 # results[0] = Person 1, results[1] = Person 2
                 # slot0_lost = True pokud Person 1 právě přešla TRACKING→LOST
                 results, slot0_lost = multi_manager.update(
-                    frame, timestamp_ms, pose_detector, image_detector, prev_frame
+                    frame, timestamp_ms, pose_detector, image_detector, prev_frame,
+                    track_second_person=debug,
                 )
                 r0 = results[0]  # Person 1
                 r1 = results[1]  # Person 2
+
+                # ── Scale-adaptivní přepínání pose modelu ──────────────────
+                # bbox_frac tohoto snímku (pokud je platná póza) → klouzavé MAX
+                # přes posledních _SCALE_WINDOW_SIZE snímků → hystereze mezi
+                # _SCALE_CLOSE_LO/_SCALE_CLOSE_HI rozhodne o aktivním modelu
+                # pro PŘÍŠTÍ snímek (tenhle už byl zpracován současným).
+                _frac = _bbox_frac(r0.get("_raw_lm"), frame.shape)
+                if _frac is not None:
+                    _scale_window.append(_frac)
+                if _scale_window:
+                    _scale_now = max(_scale_window)
+                    if active_pose_model == "yolov8" and _scale_now >= _SCALE_CLOSE_HI:
+                        active_pose_model = "mediapipe"
+                    elif active_pose_model == "mediapipe" and _scale_now <= _SCALE_CLOSE_LO:
+                        active_pose_model = "yolov8"
+                    multi_manager.set_pose_model(active_pose_model)
+                    pose_detector, image_detector = _backend_pair(active_pose_model)
 
                 # Zaznamenej backup level a čas zpracování tohoto snímku
                 backup_level   = r0.get("backup_level", 0)
@@ -256,6 +376,7 @@ def process_video(
                     jump_detector.update_missing(timestamp_ms)
                     hmm_flip_prob = flip_detector.update(None, 0.0, timestamp_ms)
                     hmm_flip = hmm_flip_prob > 0.85
+                    cov_flip_prob = coverage_detector.update(None, 0.0, timestamp_ms)
                     frame_rows.append({
                         "timestamp_ms": f"{timestamp_ms:.0f}",
                         "debug_ms":     f"{_debug_ms:.0f}",
@@ -265,6 +386,7 @@ def process_video(
                         "is_acrobatic": False,
                         "hmm_flip":     hmm_flip,
                         "hmm_flip_prob": round(hmm_flip_prob, 3),
+                        "cov_flip_prob": round(cov_flip_prob, 3),
                     })
                     _jbuf_w = list(jump_detector._buffer)
                     _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
@@ -282,6 +404,7 @@ def process_video(
                     jump_detector.update_missing(timestamp_ms)
                     hmm_flip_prob = flip_detector.update(None, 0.0, timestamp_ms)
                     hmm_flip = hmm_flip_prob > 0.85
+                    cov_flip_prob = coverage_detector.update(None, 0.0, timestamp_ms)
                     frame_rows.append({
                         "timestamp_ms": f"{timestamp_ms:.0f}",
                         "debug_ms":     f"{_debug_ms:.0f}",
@@ -291,6 +414,7 @@ def process_video(
                         "is_acrobatic": False,
                         "hmm_flip":     hmm_flip,
                         "hmm_flip_prob": round(hmm_flip_prob, 3),
+                        "cov_flip_prob": round(cov_flip_prob, 3),
                     })
                     _jbuf_w = list(jump_detector._buffer)
                     _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
@@ -321,8 +445,22 @@ def process_video(
 
                 # Flip detektor (Kalman) – aktualizace torso úhlem + confidence
                 _ta_for_flip, _ta_conf_for_flip, _ = compute_torso_angle_full(r0.get("_raw_lm"))
+
+                # POZNÁMKA k dynamickému zahuštění vzorkování (vyzkoušeno a zavrženo):
+                # Záměr byl při is_jump AND slabé torso confidence dosytit flip detektory
+                # o jinak zahazované mezilehlé nativní snímky (pending_before / loader.
+                # request_densify()). Pokus ukázal, že volání multi_manager.update() na
+                # těchto mezilehlých snímcích PERTURBUJE stavový tracker (video_detector /
+                # image_detector uvnitř PersonManager čekají přibližně pravidelný 8fps
+                # interval pro svou predikci pozice/rychlosti) – na ref4 to způsobilo NOVÝ
+                # ghost frame na oficiálním vzorku, který předtím fungoval (cov_flip_prob
+                # kleslo z 0.507 na 0.000). Proto se zde multi_manager.update NEVOLÁ mimo
+                # pravidelnou 8fps kadenci. Řešení by vyžadovalo stavově izolovanou
+                # (stateless) detekci na zamrzlém crop okně, ne polling živého trackeru.
+
                 hmm_flip_prob = flip_detector.update(_ta_for_flip, _ta_conf_for_flip, timestamp_ms)
                 hmm_flip = hmm_flip_prob > 0.85
+                cov_flip_prob = coverage_detector.update(_ta_for_flip, _ta_conf_for_flip, timestamp_ms)
 
                 # Naplnění temporálního okna
                 # Enkóduj backup level + trigger do jediného CSV čísla:
@@ -355,6 +493,7 @@ def process_video(
                         "freerun":      _freerun_warmup,
                         "hmm_flip":     hmm_flip,
                         "hmm_flip_prob": round(hmm_flip_prob, 3),
+                        "cov_flip_prob": round(cov_flip_prob, 3),
                     })
                     _jbuf_w = list(jump_detector._buffer)
                     _jbuf_v = [f"{e['y_corrected']:.5f}" if e["valid"] else "" for e in reversed(_jbuf_w)]
@@ -408,6 +547,7 @@ def process_video(
                     "freerun":      freerun,
                     "hmm_flip":     hmm_flip,
                     "hmm_flip_prob": round(hmm_flip_prob, 3),
+                    "cov_flip_prob": round(cov_flip_prob, 3),
                 })
                 rows_written += 1
 
@@ -434,12 +574,15 @@ def process_video(
                     )
 
     finally:
-        pose_detector.close()
-        image_detector.close()
+        # Oba páry (mediapipe i yolov8) byly načtené najednou kvůli scale-
+        # adaptivnímu přepínání – uzavřít je třeba oba, ne jen aktuálně aktivní.
+        _mp_video.close()
+        _yolo_video.close()
         multi_manager.log_stats()
         multi_manager.reset()
         jump_detector.reset()
         flip_detector.reset()
+        coverage_detector.reset()
         if visualizer:
             visualizer.release()
 
@@ -490,10 +633,30 @@ def process_video(
         row["freerun"] = bool(row.get("is_jump", False)) and row["flip_window"]
         row["highlight"] = row.get("freerun", False)
 
+    # ── Post-processing: acrobe / skok – jen pro konzolový výpis ──────────────
+    # Stejná zpětná logika jako flip_window, ale s nižším prahem 0.6 (ACROBE_PROB_THR)
+    # – zachytí i slabší/méně jisté otočky.
+    # acrobe = proběhla (slabší) otočka, ale BEZ skoku
+    # skok   = proběhl skok, ale BEZ (jisté, 0.85) otočky
+    ACROBE_PROB_THR = 0.6
+    for row in frame_rows:
+        row["_flip_lo"] = row.get("hmm_flip_prob", 0.0) >= ACROBE_PROB_THR
+    for row in frame_rows:
+        row["flip_window_lo"] = bool(row["_flip_lo"])
+    for i, row in enumerate(frame_rows):
+        prev_flip_lo = frame_rows[i - 1]["_flip_lo"] if i > 0 else False
+        if row["_flip_lo"] and not prev_flip_lo:
+            for j in range(max(0, i - FLIP_BACKFILL_FRAMES), i + 1):
+                frame_rows[j]["flip_window_lo"] = True
+
+    for row in frame_rows:
+        row["acrobe"] = row["flip_window_lo"] and not row.get("is_jump", False)
+        row["skok"]   = bool(row.get("is_jump", False)) and not row["flip_window"]
+
     # Zápis do CSV
     with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
         w = csv.writer(csv_file)
-        w.writerow(["timestamp_ms", "debug_ms", "highlight", "is_jump", "freerun", "hmm_flip", "hmm_flip_prob", "flip_window", "backup", "action"])
+        w.writerow(["timestamp_ms", "debug_ms", "highlight", "is_jump", "freerun", "hmm_flip", "hmm_flip_prob", "flip_window", "cov_flip_prob", "backup", "action"])
         for row in frame_rows:
             w.writerow([
                 row["timestamp_ms"],
@@ -504,11 +667,16 @@ def process_video(
                 str(row.get("hmm_flip", False)),
                 row.get("hmm_flip_prob", 0.0),
                 str(row.get("flip_window", False)),
+                row.get("cov_flip_prob", 0.0),
                 str(row["backup"]),
                 row["action"],
             ])
             if row["highlight"]:
                 highlight_timestamps.append(float(row["timestamp_ms"]))
+            if row["acrobe"]:
+                acrobe_timestamps.append(float(row["timestamp_ms"]))
+            if row["skok"]:
+                skok_timestamps.append(float(row["timestamp_ms"]))
 
     # ── Sumarizace backup fallbacku ──────────────────────────────────────────
     total_frames = sum(backup_counts.values())
@@ -559,6 +727,55 @@ def process_video(
         print('='*50)
     else:
         print("\nHIGHLIGHTS: žádné")
+
+    # Výpis acrobe timestampů (otočka bez skoku, práh 0.6)
+    if acrobe_timestamps:
+        print(f"\n{'='*50}")
+        print(f"ACROBE ({len(acrobe_timestamps)} událostí):")
+        for ts in acrobe_timestamps:
+            secs = ts / 1000.0
+            mins = int(secs // 60)
+            print(f"  {mins:02d}:{secs % 60:06.3f}  ({ts:.0f} ms)")
+        print('='*50)
+    else:
+        print("\nACROBE: žádné")
+
+    # Výpis skok timestampů (skok bez otočky)
+    if skok_timestamps:
+        print(f"\n{'='*50}")
+        print(f"SKOK ({len(skok_timestamps)} událostí):")
+        for ts in skok_timestamps:
+            secs = ts / 1000.0
+            mins = int(secs // 60)
+            print(f"  {mins:02d}:{secs % 60:06.3f}  ({ts:.0f} ms)")
+        print('='*50)
+    else:
+        print("\nSKOK: žádné")
+
+    # ── Clustery: sousední časy (v rámci kategorie) se sloučí, pokud je mezera
+    # <= 3s. Full_cluster = hranice clusteru rozšířená o 2 snímky před/po. ─────
+    print(f"\n{'#'*55}")
+    print("CLUSTERY (spojení časů <= 3s do jednoho okna, hranice ±2 snímky)")
+    print(f"{'#'*55}")
+    _print_full_clusters("HIGHLIGHTS", highlight_timestamps, target_fps)
+    _print_full_clusters("ACROBE", acrobe_timestamps, target_fps)
+    _print_full_clusters("SKOK", skok_timestamps, target_fps)
+    print(f"{'#'*55}")
+
+    # ── Realtime rezerva: čas zpracování vs. reálná délka videa ───────────────
+    video_duration_s = info["total_frames"] / info["fps"] if info["fps"] > 0 else 0.0
+    if video_duration_s > 0:
+        pct_of_realtime = elapsed / video_duration_s * 100.0
+        headroom_pct = 100.0 - pct_of_realtime
+        print(f"\n{'='*55}")
+        print("VÝKON – realtime rezerva")
+        print(f"{'='*55}")
+        print(f"  Zpracování trvalo   : {elapsed:.1f} s")
+        print(f"  Délka videa         : {video_duration_s:.1f} s")
+        print(f"  Poměr k reál. času  : {pct_of_realtime:.1f} %")
+        print(f"  Rezerva             : {headroom_pct:.1f} %")
+        print('='*55)
+
     return rows_written
 
 

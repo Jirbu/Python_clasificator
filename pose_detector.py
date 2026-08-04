@@ -43,6 +43,45 @@ _DEFAULT_MODEL_PATH = os.path.join(
 )
 
 
+def _letterbox_resize(frame: np.ndarray, target_w: int, target_h: int):
+    """
+    Zmenší frame na (target_w, target_h) se zachováním poměru stran (letterbox/pillarbox
+    – doplní černé okraje), místo prostého cv2.resize, které by obraz deformovalo,
+    pokud se poměr stran vstupu liší od cílového (typicky čtvercový crop -> 16:9 cíl).
+
+    Vrací (canvas, new_w, new_h, pad_x, pad_y) – new_w/new_h je rozměr obrazu PO
+    škálování (před doplněním okrajů), pad_x/pad_y je posun tohoto obrazu v canvasu.
+    """
+    h, w = frame.shape[:2]
+    if w < 1 or h < 1:
+        return cv2.resize(frame, (target_w, target_h)), target_w, target_h, 0, 0
+
+    scale = min(target_w / w, target_h / h)
+    new_w = max(1, round(w * scale))
+    new_h = max(1, round(h * scale))
+    resized = cv2.resize(frame, (new_w, new_h))
+
+    pad_x = (target_w - new_w) // 2
+    pad_y = (target_h - new_h) // 2
+    canvas = np.zeros((target_h, target_w, frame.shape[2]), dtype=frame.dtype)
+    canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+    return canvas, new_w, new_h, pad_x, pad_y
+
+
+def _unletterbox_landmarks(
+    lm: np.ndarray, target_w: int, target_h: int, new_w: int, new_h: int, pad_x: int, pad_y: int,
+) -> np.ndarray:
+    """
+    Přepočítá landmarks x,y (normalizované [0,1] vůči letterboxed canvasu) zpět na
+    souřadnice normalizované vůči PŮVODNÍMU (nedeformovanému) vstupnímu obrázku –
+    stejná konvence, jakou by vrátil prostý (nedistorzní) resize.
+    """
+    out = lm.copy()
+    out[:, 0] = (lm[:, 0] * target_w - pad_x) / new_w
+    out[:, 1] = (lm[:, 1] * target_h - pad_y) / new_h
+    return out
+
+
 def _ensure_model(model_path: str = _DEFAULT_MODEL_PATH) -> str:
     """
     Pokud model ještě neexistuje, stáhne ho z Google Storage.
@@ -85,19 +124,24 @@ class PoseDetector:
             min_tracking_confidence=min_tracking_confidence,
         )
         self._landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+        # Parametry posledního letterboxu (new_w, new_h, pad_x, pad_y) – nastaví
+        # preprocess_frame(), spotřebuje extract_landmarks() pro zpětný přepočet.
+        self._last_letterbox = (TARGET_WIDTH, TARGET_HEIGHT, 0, 0)
 
     def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
         """
-        Zmenší snímek na TARGET_WIDTH x TARGET_HEIGHT a převede BGR -> RGB.
+        Zmenší snímek na TARGET_WIDTH x TARGET_HEIGHT (letterbox – zachová poměr
+        stran, nedeformuje geometrii) a převede BGR -> RGB.
         MediaPipe Tasks API očekává RGB vstup.
         """
         # KROK 1: Downscale – vstupní BGR snímek (libovolné rozlišení z videa)
         # se zmenší na pevné 256×144 px. To snižuje výpočetní náklady MediaPipe.
-        resized = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT))
+        canvas, new_w, new_h, pad_x, pad_y = _letterbox_resize(frame, TARGET_WIDTH, TARGET_HEIGHT)
+        self._last_letterbox = (new_w, new_h, pad_x, pad_y)
 
         # KROK 2: BGR → RGB konverze. Snímek zůstává barevný (3 kanály).
         # Žádný grayscale se zde neaplikuje – MediaPipe dostává plný barevný obraz.
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         return rgb
 
     def detect_pose(self, frame: np.ndarray, timestamp_ms: float):
@@ -115,7 +159,9 @@ class PoseDetector:
         Z PoseLandmarkerResult extrahuje numpy pole tvaru (33, 4):
           sloupce: [x, y, z, visibility]
 
-        Souřadnice x, y jsou normalizovány do [0, 1] relativně k rozlišení.
+        Souřadnice x, y jsou normalizovány do [0, 1] relativně k původnímu
+        (nedeformovanému) vstupnímu snímku – letterbox padding z preprocess_frame()
+        se tu odečte zpět.
         Pokud pose nebyla detekována, vrátí None.
         """
         if pose_results is None or not pose_results.pose_landmarks:
@@ -127,6 +173,8 @@ class PoseDetector:
             visibility = lm.visibility if lm.visibility is not None else 1.0
             landmarks[i] = [lm.x, lm.y, lm.z, visibility]
 
+        new_w, new_h, pad_x, pad_y = self._last_letterbox
+        landmarks = _unletterbox_landmarks(landmarks, TARGET_WIDTH, TARGET_HEIGHT, new_w, new_h, pad_x, pad_y)
         return landmarks
 
     def process_frame(self, frame: np.ndarray, timestamp_ms: float) -> np.ndarray | None:
@@ -185,6 +233,28 @@ class PoseDetectorImage:
         )
         self._landmarker = mp_vision.PoseLandmarker.create_from_options(options)
 
+    def _detect_all_at(self, frame: np.ndarray, target_w: int, target_h: int) -> list[np.ndarray]:
+        """Společná implementace detect_all/detect_all_hires – letterbox resize
+        na (target_w, target_h), detekce, a přepočet landmarks zpět bez deformace."""
+        canvas, new_w, new_h, pad_x, pad_y = _letterbox_resize(frame, target_w, target_h)
+        rgb    = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self._landmarker.detect(mp_img)
+
+        out: list[np.ndarray] = []
+        if not result.pose_landmarks:
+            return out
+        for pose in result.pose_landmarks:
+            lm = np.zeros((NUM_LANDMARKS, 4), dtype=np.float32)
+            for i, pt in enumerate(pose):
+                lm[i] = [
+                    pt.x, pt.y, pt.z,
+                    pt.visibility if pt.visibility is not None else 1.0,
+                ]
+            lm = _unletterbox_landmarks(lm, target_w, target_h, new_w, new_h, pad_x, pad_y)
+            out.append(lm)
+        return out
+
     def detect_all(self, frame: np.ndarray) -> list[np.ndarray]:
         """
         Detekuje všechny pózy v snímku.
@@ -195,23 +265,7 @@ class PoseDetectorImage:
 
         Prázdný list pokud nebyla detekována žádná póza.
         """
-        resized = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT))
-        rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result  = self._landmarker.detect(mp_img)
-
-        out: list[np.ndarray] = []
-        if not result.pose_landmarks:
-            return out
-        for pose in result.pose_landmarks:
-            lm = np.zeros((NUM_LANDMARKS, 4), dtype=np.float32)
-            for i, pt in enumerate(pose):
-                lm[i] = [
-                    pt.x, pt.y, pt.z,
-                    pt.visibility if pt.visibility is not None else 1.0,
-                ]
-            out.append(lm)
-        return out
+        return self._detect_all_at(frame, TARGET_WIDTH, TARGET_HEIGHT)
 
     def detect_all_hires(self, frame: np.ndarray) -> list[np.ndarray]:
         """
@@ -219,23 +273,7 @@ class PoseDetectorImage:
         (512×288) místo standardních 256×144.
         Použití: hires fallback pokud standardní detekce vrátila suspicious result.
         """
-        resized = cv2.resize(frame, (HIRES_WIDTH, HIRES_HEIGHT))
-        rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result  = self._landmarker.detect(mp_img)
-
-        out: list[np.ndarray] = []
-        if not result.pose_landmarks:
-            return out
-        for pose in result.pose_landmarks:
-            lm = np.zeros((NUM_LANDMARKS, 4), dtype=np.float32)
-            for i, pt in enumerate(pose):
-                lm[i] = [
-                    pt.x, pt.y, pt.z,
-                    pt.visibility if pt.visibility is not None else 1.0,
-                ]
-            out.append(lm)
-        return out
+        return self._detect_all_at(frame, HIRES_WIDTH, HIRES_HEIGHT)
 
     def close(self):
         """Uvolní MediaPipe zdroje."""

@@ -188,7 +188,7 @@ class FlipDetector:
                 dt = min(max((ts_i - last_ts) / 1000.0, self.dt_min), self.dt_max)
                 pred = self._kf_predict(state, dt)
                 use_angle = angle_i if (accept and angle_i is not None) else None
-                state, innovation, s = self._kf_update(pred, use_angle, conf_i)
+                state, innovation, s = self._kf_update(pred, use_angle, conf_i, dt)
                 if use_angle is not None:
                     cost += (innovation * innovation) / max(s, 1e-6)  # NIS – "překvapivost" relativně k nejistotě predikce
                 elif angle_i is not None:
@@ -214,7 +214,7 @@ class FlipDetector:
         return (angle_pred, vel_pred, p00_pred, p01_pred, p11_pred)
 
     def _kf_update(
-        self, pred: KalmanState, angle: float | None, confidence: float,
+        self, pred: KalmanState, angle: float | None, confidence: float, dt: float = 0.0,
     ) -> tuple[KalmanState, float, float]:
         """Vrací (nový stav, inovace, S = kovariance inovace) – S umožňuje volajícímu
         normalizovat "překvapivost" měření podle aktuální nejistoty predikce
@@ -228,7 +228,19 @@ class FlipDetector:
         if angle is None:
             return (angle_pred, vel_pred, p00_pred, p01_pred, p11_pred), 0.0, s
 
-        innovation = angle_diff(angle_pred % 360.0, angle % 360.0)  # = z_unwrapped - angle_pred
+        innovation = angle_diff(angle_pred % 360.0, angle % 360.0)  # = z_unwrapped - angle_pred, v [-180,180]
+
+        # Rozbalení nejednoznačnosti "aliasingu": angle_diff dá vždy NEJKRATŠÍ
+        # cestu (±180°), ale při rychlé rotaci mezi dvěma vzorky (zvlášť po
+        # výpadku snímku, delší dt) se postava mohla reálně otočit o víc než
+        # 180° – nejkratší cesta pak ukazuje OPAČNÝ směr, než k jakému model
+        # (na základě aktuální rychlosti) směřuje. Zvol tu z {innovation,
+        # innovation±360} variant, která nejlíp odpovídá tomu, co model už
+        # sám očekává (vel_pred*dt), místo slepě nejmenší abs. hodnoty.
+        expected_step = vel_pred * dt
+        for cand in (innovation + 360.0, innovation - 360.0):
+            if abs(cand - expected_step) < abs(innovation - expected_step):
+                innovation = cand
 
         gate = max(self.outlier_gate_deg, self.outlier_gate_sigma * math.sqrt(max(s, 1e-6)))
 
@@ -275,7 +287,7 @@ class FlipDetector:
 
         state = (self.x_angle, self.x_vel, self.p00, self.p01, self.p11)
         pred = self._kf_predict(state, dt)
-        (angle_new, vel_new, p00_new, p01_new, p11_new), innovation, s = self._kf_update(pred, angle, confidence)
+        (angle_new, vel_new, p00_new, p01_new, p11_new), innovation, s = self._kf_update(pred, angle, confidence, dt)
 
         gate = max(self.outlier_gate_deg, self.outlier_gate_sigma * math.sqrt(max(s, 1e-6)))
         used_conf = confidence if (angle is not None and abs(innovation) <= gate) else 0.0
@@ -335,3 +347,91 @@ class FlipDetector:
         self._prob = 0.0
         self._net  = 0.0
         self._reset_state()
+
+
+class CoverageFlipDetector:
+    """
+    Alternativní detektor plné otočky, NEZÁVISLÝ na FlipDetector výše.
+
+    FlipDetector skládá znaménkové přírůstky úhlu (Kalman) – to selže, když
+    jednotlivý krok mezi dvěma vzorky reálně přesáhne 180° (rychlá rotace při
+    řídkém vzorkování, např. 8fps): "nejkratší cesta" pak často ukáže OPAČNÝ
+    směr, než k jakému rotace skutečně směřuje (aliasing), a při více takových
+    kroků za sebou se to může navzájem vyrušit místo nahromadit.
+
+    Tenhle detektor se aliasingu vyhýbá úplně – nezajímá ho směr ani pořadí
+    vzorků, jen to, jestli syrové (zabalené, 0-360°) úhly v krátkém okně
+    POKRYJÍ velkou část kruhu. Postup:
+      1. Udrž syrové úhly (jen s dostatečnou confidence) v klouzavém okně.
+      2. Seřaď je na kružnici, najdi největší "mezeru" mezi sousedy.
+      3. pokrytí = 360° - největší_mezera. Vysoké pokrytí (~300°+) znamená,
+         že vzorky obsáhly skoro celý kruh → tělo prošlo mnoha orientacemi.
+
+    Vhodné jako DOPLNĚK k FlipDetector (ne náhrada) – kombinovat např. přes OR
+    nebo max() obou pravděpodobností.
+    """
+
+    def __init__(
+        self,
+        window_ms: float = 1200.0,
+        min_confidence: float = 0.1,
+        min_samples: int = 4,
+        coverage_lo: float = 90.0,
+        coverage_hi: float = 140.0,
+    ):
+        self.window_ms      = window_ms
+        self.min_confidence = min_confidence
+        self.min_samples    = min_samples
+        self.coverage_lo    = coverage_lo
+        self.coverage_hi    = coverage_hi
+
+        self._window: deque[tuple[float, float]] = deque()  # (timestamp_ms, angle)
+        self._prob = 0.0
+        self._coverage = 0.0
+        self._last_ts: float | None = None
+
+    def update(self, angle: float | None, confidence: float = 1.0, timestamp_ms: float | None = None) -> float:
+        if timestamp_ms is None:
+            timestamp_ms = (self._last_ts + 33.0) if self._last_ts is not None else 0.0
+        self._last_ts = timestamp_ms
+
+        if angle is not None and confidence >= self.min_confidence:
+            self._window.append((timestamp_ms, angle % 360.0))
+
+        cutoff = timestamp_ms - self.window_ms
+        while self._window and self._window[0][0] < cutoff:
+            self._window.popleft()
+
+        angles = sorted(a for _, a in self._window)
+        n = len(angles)
+        if n < self.min_samples:
+            self._prob = 0.0
+            self._coverage = 0.0
+            return self._prob
+
+        max_gap = 0.0
+        for i in range(n):
+            a = angles[i]
+            b = angles[(i + 1) % n]
+            gap = (b - a) if i < n - 1 else (360.0 - a + angles[0])
+            if gap > max_gap:
+                max_gap = gap
+
+        coverage = 360.0 - max_gap
+        self._coverage = coverage
+        self._prob = _smoothstep(coverage, self.coverage_lo, self.coverage_hi)
+        return self._prob
+
+    @property
+    def flip_probability(self) -> float:
+        return float(self._prob)
+
+    @property
+    def coverage_deg(self) -> float:
+        return float(self._coverage)
+
+    def reset(self) -> None:
+        self._window.clear()
+        self._prob = 0.0
+        self._coverage = 0.0
+        self._last_ts = None

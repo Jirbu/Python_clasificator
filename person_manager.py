@@ -31,7 +31,6 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
-import cv2
 
 from person_tracker             import PersonTracker
 from pose_validator             import PoseValidator
@@ -40,6 +39,17 @@ from appearance_validator       import AppearanceValidator
 from pose_consistency_validator import PoseConsistencyValidator
 from scale_change_detector import ScaleChangeDetector
 from pose_detector              import LANDMARK_INDEX
+import pose_backends
+
+# suspicious_thr u PoseConsistencyValidator – MediaPipe-vyladěná výchozí hodnota
+# byla 3.0 (viz changes_to_yolo.md). Jiné modely mají jiný frame-to-frame jitter
+# profil, takže se stejným prahem zbytečně spouští backup i na genuinní rychlý
+# pohyb (přesně na akrobacii, která nás zajímá nejvíc).
+_SUSPICIOUS_THR_BY_MODEL: dict[str, float] = {
+    "mediapipe": 3.0,
+    "yolov8":    6.0,
+    "movenet":   3.0,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +76,22 @@ _POSE_VIS_AVG_THR         = 0.15   # min průměrná visibility všech klíč. k
 _POSE_VIS_MIN_JOINT_THR   = 0.15   # min visibility NEJHORŠÍHO kloubu
 
 # pose_geo (L2) – PoseValidator: geometrie
-_POSE_GEO_MIN_TORSO       = 0.03   # min výška torza (norm.)
+_POSE_GEO_MIN_TORSO       = 0.03   # min výška torza (norm.) – MediaPipe hodnota, viz changes_to_yolo.md
+_POSE_GEO_MIN_TORSO_BY_MODEL: dict[str, float] = {
+    "mediapipe": 0.03,
+    "yolov8":    0.015,   # stejná hodnota jako stávající "relaxed" režim – viz changes_to_yolo.md
+    "movenet":   0.03,
+}
+# min. šíře ramen/boků (norm.) – MediaPipe default byl 0.01 (natvrdo v PoseValidator).
+# Při rotaci/saltu se ramena i boky občas promítnou skoro na sebe (pohled téměř
+# z boku) – u YOLOv8 se to ukázalo být DOMINANTNÍ příčinou odmítnutí (746/754
+# geometrických selhání v testu na IMG_6497.MOV), zatímco torso_height byla
+# vždy v pořádku. Viz changes_to_yolo.md.
+_POSE_GEO_MIN_WIDTH_BY_MODEL: dict[str, float] = {
+    "mediapipe": 0.01,
+    "yolov8":    0.0005,
+    "movenet":   0.01,
+}
 
 # kin_score – kinematický early filter
 _MAX_KIN_DIST         = 0.45   # max odchylka od predikce (nad tím = FAIL) – normální stav
@@ -77,6 +102,23 @@ _MAX_KIN_DIST_RELAXED = 1.50   # uvolněný limit při LOST / full-frame fallbac
 # full_frame: přísnější – ve full-frame chceme vidět pohyb
 _MOTION_HARD_THR_CROP     = 0.29   # min (1-sim) pro crop pipeline  [= 1 - threshold_static(0.71)]
 _MOTION_HARD_THR_FULL     = 0.40   # min (1-sim) pro full-frame pipeline
+# Diagnostika na referenčních klipech (IMG_6497.MOV) ukázala, že tohle je teď
+# DOMINANTNÍ blokující místo (145/297 snímků, ~49 %) – naměřené hodnoty (1-sim)
+# byly těsně pod 0.29 (0.18-0.29), ne blízko nule (skutečně statický snímek).
+# sim_score se počítá z obrazových pixelů (ne z landmarků), takže to není čistě
+# "YOLOv8 vs MediaPipe" věc – spíš tenhle práh byl vždycky moc přísný na rychlou
+# akrobacii při 8fps vzorkování, jen se to dřív neprojevilo (tyhle snímky
+# padaly už dřív na geometrii). Viz changes_to_yolo.md.
+_MOTION_HARD_THR_CROP_BY_MODEL: dict[str, float] = {
+    "mediapipe": 0.29,
+    "yolov8":    0.10,
+    "movenet":   0.29,
+}
+_MOTION_HARD_THR_FULL_BY_MODEL: dict[str, float] = {
+    "mediapipe": 0.40,
+    "yolov8":    0.15,
+    "movenet":   0.40,
+}
 
 # final_conf – vážená kombinace
 _W_TRACKER    = 0.40   # presence_prob z PersonTracker (temporální stabilita)
@@ -289,11 +331,15 @@ class PersonSlot:
         self.pose_validator       = PoseValidator(
             visibility_threshold=_POSE_VIS_AVG_THR,
             min_key_joint_visibility=_POSE_VIS_MIN_JOINT_THR,
-            min_torso_height=_POSE_GEO_MIN_TORSO,
+            min_torso_height=_POSE_GEO_MIN_TORSO_BY_MODEL.get(pose_backends.POSE_MODEL, _POSE_GEO_MIN_TORSO),
+            min_shoulder_width=_POSE_GEO_MIN_WIDTH_BY_MODEL.get(pose_backends.POSE_MODEL, 0.01),
+            min_hip_width=_POSE_GEO_MIN_WIDTH_BY_MODEL.get(pose_backends.POSE_MODEL, 0.01),
         )
         self.motion_validator       = MotionValidator()
         self.appearance_validator   = AppearanceValidator()
-        self.consistency_validator  = PoseConsistencyValidator()
+        self.consistency_validator  = PoseConsistencyValidator(
+            suspicious_thr=_SUSPICIOUS_THR_BY_MODEL.get(pose_backends.POSE_MODEL, 3.0)
+        )
         self.scale_detector         = ScaleChangeDetector()
 
         # Stav
@@ -388,6 +434,27 @@ class PersonManager:
         self._candidate: _Candidate | None = None
         self._frame_wh: tuple[int, int] = (1, 1)
 
+    def set_pose_model(self, model: str) -> None:
+        """
+        Přepne aktivní pose model za běhu (pro scale-adaptivní přepínání
+        MediaPipe/YOLOv8 dle vzdálenosti sledované osoby od kamery).
+
+        `_BY_MODEL` prahy v tomto souboru (motion hard-threshold apod.) se čtou
+        živě z `pose_backends.POSE_MODEL` každý snímek, takže se samy
+        promítnou. Prahy zapečené při konstrukci validátorů (min_torso_height/
+        min_shoulder_width/min_hip_width/suspicious_thr) je ale potřeba
+        přenastavit explicitně zde, jinak by zůstaly u modelu, se kterým byl
+        PersonManager vytvořen.
+        """
+        if model == pose_backends.POSE_MODEL:
+            return
+        pose_backends.POSE_MODEL = model
+        for slot in self.slots:
+            slot.pose_validator.min_torso_height   = _POSE_GEO_MIN_TORSO_BY_MODEL.get(model, _POSE_GEO_MIN_TORSO)
+            slot.pose_validator.min_shoulder_width = _POSE_GEO_MIN_WIDTH_BY_MODEL.get(model, 0.01)
+            slot.pose_validator.min_hip_width      = _POSE_GEO_MIN_WIDTH_BY_MODEL.get(model, 0.01)
+            slot.consistency_validator.suspicious_thr = _SUSPICIOUS_THR_BY_MODEL.get(model, 3.0)
+
     # ── Hlavní metoda ──────────────────────────────────────────────────────────
 
     def update(
@@ -397,24 +464,43 @@ class PersonManager:
         video_detector,    # PoseDetector (VIDEO mode) – P1 full-frame
         image_detector,    # PoseDetectorImage (IMAGE mode) – crop + scan
         prev_frame: np.ndarray | None = None,  # poslední přeskočený snímek před tímto
+        track_second_person: bool = True,
     ) -> tuple[list[dict], bool]:
 
         # Uložíme rozlišení framu pro pixel-správný čtvercový crop
         self._frame_wh = (frame.shape[1], frame.shape[0])
 
-        # Pre-compute full-frame IMAGE scan jednou (sdíleno fallback + P2 scan)
-        scan_all = image_detector.detect_all(frame)
+        # Full-frame IMAGE scan (sdíleno fallback + P2 scan) – LÍNĚ, ne vždy.
+        # Je to celo-snímková mediapipe inference navíc; potřebujeme ji jen když:
+        #   a) crop pipeline P1 selže (fallback zdroj kandidátů),
+        #   b) P1 má scale switch (okamžitá inicializace P2),
+        #   c) P2 (slot 1) je EMPTY a hledáme kandidáta.
+        # Když crop běží zdravě a P2 už je locknutý, scan_all se vůbec nespočítá.
+        _scan_all_cache: list | None = None
+
+        def get_scan_all() -> list:
+            nonlocal _scan_all_cache
+            if _scan_all_cache is None:
+                _scan_all_cache = image_detector.detect_all(frame)
+            return _scan_all_cache
 
         # ── Slot 0: Person 1 ──────────────────────────────────────────────
         r0, lost_transition = self._update_slot0(
-            frame, timestamp_ms, video_detector, image_detector, scan_all, prev_frame
+            frame, timestamp_ms, video_detector, image_detector, get_scan_all, prev_frame
         )
 
         # ── Slot 1: Person 2 ──────────────────────────────────────────────
+        # Person 2 se dál nikde nevyužívá mimo --debug vizualizaci (main.py) –
+        # její tracking stojí vlastní detekční volání navíc (scan_all/crop/hires
+        # fallback), proto se dá v produkčním/realtime běhu úplně vypnout.
+        if not track_second_person:
+            r1 = self._empty_result(1)
+            return [r0, r1], lost_transition
+
         # Pokud byl detekován scale switch na P1, okamžitě inicializuj P2
         # ze scan_all (bez čekání na _CANDIDATE_CONFIRM)
         if r0.get("scale_switch") and self.slots[1].state == self.slots[1].EMPTY:
-            for lm in scan_all:
+            for lm in get_scan_all():
                 conf = float(np.mean([lm[i, 3] for i in _KEY_IDX]))
                 if conf < _MIN_KEY_VIS:
                     continue
@@ -426,7 +512,7 @@ class PersonManager:
                 self._candidate = None
                 break
 
-        r1 = self._update_slot1(frame, image_detector, scan_all, r0)
+        r1 = self._update_slot1(frame, image_detector, get_scan_all, r0)
 
         return [r0, r1], lost_transition
 
@@ -438,7 +524,7 @@ class PersonManager:
         timestamp_ms: float,
         video_detector,
         image_detector,
-        scan_all: list,
+        get_scan_all,
         prev_frame: np.ndarray | None = None,
     ) -> tuple[dict, bool]:
         slot = self.slots[0]
@@ -459,7 +545,10 @@ class PersonManager:
             # 1. Pokus o crop detekci (IMAGE mode – stateless, přesný)
             # GHOST/LOST stav: uvolněný kinematický limit (osoba může skokem být daleko)
             is_relaxed = slot.state in (slot.GHOST, slot.LOST)
-            lm_crop = self._detect_in_crop(frame, crop, image_detector)
+            # hires (512×288) jako výchozí rozlišení pro crop detekci místo
+            # standardu (256×144) – změřeno: méně L2 eskalací, méně "bez pózy",
+            # i celkově rychlejší (méně nutných backup pokusů jinde ve videu).
+            lm_crop = self._detect_in_crop_hires(frame, crop, image_detector)
             crop_ok, lm_c, kin_c, c_stage, c_val, c_ref = self._early_filter(
                 slot, lm_crop, relaxed_kin=is_relaxed
             )
@@ -467,17 +556,18 @@ class PersonManager:
             pipe_debug["crop_val"]   = c_val if not crop_ok else None
             pipe_debug["crop_ref"]   = c_ref if not crop_ok else None
 
-            # Vždy voláme VIDEO detektor (udržuje MediaPipe inter-frame stav)
-            lm_video = video_detector.process_frame(frame, timestamp_ms)
-
             if crop_ok:
                 effective_lm = lm_c
                 kin_score    = kin_c
                 pipe_used    = "crop"
             else:
-                # 2. Full-frame fallback: VIDEO výsledek nebo nejbližší ze scanu
+                # 2. Full-frame fallback: VIDEO výsledek nebo nejbližší ze scanu.
+                # VIDEO detektor voláme až tady – jen když ho skutečně potřebujeme
+                # (crop selhal). Když crop běží zdravě, ušetříme celou tuhle
+                # celo-snímkovou inferenci navíc.
                 # Uvolněný kinematický limit – crop selhal, person může být jinde (skok/pád)
-                lm_full = lm_video if lm_video is not None else self._nearest_to(scan_all, slot)
+                lm_video = video_detector.process_frame(frame, timestamp_ms)
+                lm_full  = lm_video if lm_video is not None else self._nearest_to(get_scan_all(), slot)
                 full_ok, lm_f, kin_f, f_stage, f_val, f_ref = self._early_filter(
                     slot, lm_full, relaxed_kin=True
                 )
@@ -492,7 +582,7 @@ class PersonManager:
             detection_crop = None   # žádný crop, detekce ve full-frame
             # VIDEO full-frame, nebo nejbližší ze scanu
             lm_video = video_detector.process_frame(frame, timestamp_ms)
-            lm_full  = lm_video if lm_video is not None else self._nearest_to(scan_all, slot)
+            lm_full  = lm_video if lm_video is not None else self._nearest_to(get_scan_all(), slot)
             full_ok, lm_v, kin_v, f_stage, f_val, f_ref = self._early_filter(slot, lm_full)
             pipe_debug["full_stage"] = "pass" if full_ok else f_stage
             pipe_debug["full_val"]   = f_val if not full_ok else None
@@ -593,13 +683,13 @@ class PersonManager:
         self,
         frame: np.ndarray,
         image_detector,
-        scan_all: list,
+        get_scan_all,
         r0: dict,
     ) -> dict:
         slot = self.slots[1]
 
         if slot.state == slot.EMPTY:
-            self._handle_p2_scan(scan_all, r0)
+            self._handle_p2_scan(get_scan_all(), r0)
             return self._empty_result(1)
 
         # P2 je TRACKING, GHOST nebo LOST – detekce pouze v crop
@@ -734,7 +824,11 @@ class PersonManager:
 
         # Tvrdý motion práh (různý pro crop vs full-frame)
         if valid_pose:
-            motion_thr = _MOTION_HARD_THR_CROP if pipe_used in ("crop", "crop_hires") else _MOTION_HARD_THR_FULL
+            _model = pose_backends.POSE_MODEL
+            if pipe_used in ("crop", "crop_hires"):
+                motion_thr = _MOTION_HARD_THR_CROP_BY_MODEL.get(_model, _MOTION_HARD_THR_CROP)
+            else:
+                motion_thr = _MOTION_HARD_THR_FULL_BY_MODEL.get(_model, _MOTION_HARD_THR_FULL)
             if (1.0 - sim_score) < motion_thr:
                 valid_pose   = False
                 effective_lm = None

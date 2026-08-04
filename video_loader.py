@@ -64,20 +64,46 @@ class VideoLoader:
         """
         return (frame_index / self.video_fps) * 1000.0
 
+    def request_densify(self) -> None:
+        """
+        Zavolat z volajícího kódu ihned po zpracování pravidelného (8fps) snímku,
+        pokud nastal trigger pro dynamické zahuštění vzorkování (např. is_jump
+        AND slabá confidence torso úhlu). Do dalšího pravidelného vzorku pak
+        frame_generator() navíc vyzvedne i jinak zahazované nativní snímky.
+        """
+        self._densify_active = True
+
     def frame_generator(self):
         """
-        Generátor, který yieldi (timestamp_ms, frame, prev_frame) tuplu pro každý
-        analyzovaný snímek (tzn. po frame_step krocích).
+        Generátor, který yieldi (timestamp_ms, frame, prev_frame, pending_before,
+        is_regular) tuplu.
+
+        Za normálních okolností (bez zahuštění) se yieldí jen každý N-tý (frame_step)
+        snímek – is_regular=True, stejně jako dřív.
+
+        pending_before -- seznam (timestamp_ms, frame) nativních snímků zahozených
+                      TĚSNĚ PŘED tímto pravidelným vzorkem (od posledního pravidelného
+                      vzorku, max frame_step-1 položek). Umožňuje volajícímu zpětně
+                      dosytit detektory rotace, pokud se ukáže, že právě tento vzorek
+                      je "podezřelý" (rychlá/nejednoznačná rotace).
 
         prev_frame -- poslední přeskočený snímek těsně PŘED aktuálním zpracovaným
                       snímkem (nebo None pro první snímek). Lze použít jako čistší
                       alternativu k aktuálnímu snímku při hires fallbacku.
+
+        is_regular -- True pro běžný (8fps) vzorek, False pro extra snímek doručený
+                      jen díky aktivnímu zahuštění (request_densify()) – takový
+                      snímek NENÍ součástí pravidelné kadence a volající by ho neměl
+                      počítat do frames_processed/CSV řádků, jen ho může použít jako
+                      dodatečný vstup pro detektory rotace.
 
         Vypočítává timestamp z absolutního indexu snímku v původním videu,
         aby timestamp přesně odpovídal pozici v čase.
         """
         frame_index = 0
         prev_frame = None
+        pending_before: list[tuple[float, "cv2.Mat"]] = []
+        self._densify_active = False
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # reset na začátek
 
         while True:
@@ -85,13 +111,26 @@ class VideoLoader:
             if not ret:
                 break
 
-            # Zpracuj pouze každý N-tý snímek
+            timestamp_ms = self.calculate_timestamp_ms(frame_index)
+
+            # Zpracuj pravidelně každý N-tý snímek
             if frame_index % self.frame_step == 0:
-                timestamp_ms = self.calculate_timestamp_ms(frame_index)
-                yield timestamp_ms, frame, prev_frame
-                prev_frame = None  # reset – příští přeskočený snímek přepíše
+                this_pending = pending_before
+                pending_before = []
+                prev_frame_out = prev_frame
+                prev_frame = None
+                # Zahuštění se řeší vždy jen do PŘÍŠTÍHO pravidelného vzorku –
+                # volající si ho musí požádat znovu, pokud má pokračovat.
+                self._densify_active = False
+                yield timestamp_ms, frame, prev_frame_out, this_pending, True
+            elif self._densify_active:
+                yield timestamp_ms, frame, None, [], False
             else:
-                prev_frame = frame  # pamatuj si poslední přeskočený snímek
+                # pamatuj si poslední přeskočený snímek + krátkou historii pro pending_before
+                prev_frame = frame
+                pending_before.append((timestamp_ms, frame))
+                if len(pending_before) >= self.frame_step:
+                    pending_before.pop(0)
 
             frame_index += 1
 
