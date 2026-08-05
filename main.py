@@ -619,19 +619,33 @@ def process_video(
             frame_rows[i]["hmm_flip"]      = hmm_flip_vals[i + lag]
             frame_rows[i]["hmm_flip_prob"] = hmm_flip_prob_vals[i + lag]
 
-    # ── Post-processing: flip_window – zpětné označení snímků rotace ─────────
-    # hmm_flip se aktivuje až po nahromadění dostatečné rotace, takže samotný
-    # náběh (prvních pár desítek stupňů rotace) mu unikne – proto se vzestupná
-    # hrana zpětně promítne na FLIP_BACKFILL_FRAMES předchozích snímků.
-    # Celé plató hmm_flip=True (ne jen náběh) se počítá taky – proti dopřednému
-    # "doznívání" do snímků bez platné pózy (osoba mimo záběr při dopadu) chrání
-    # už samotné is_jump, které je v takových snímcích napevno False.
-    FLIP_BACKFILL_FRAMES = 4
+    # ── Post-processing: kombinovaný flip signál ──────────────────────────────
+    # hmm_flip_prob (Kalman, směrový součet rotace) a cov_flip_prob (nezávislý,
+    # na směru/pořadí necitlivý rozsah kruhu) běží paralelně – žádný jeden z nich
+    # nenahrazuje druhý. Pro finální rozhodnutí (flip_window/acrobe/skok) se
+    # použije max() z obou: stačí, aby si byl jistý ALESPOŇ jeden detektor.
+    # Ověřeno na dvou referenčních videích: cov_flip_prob samotný zachytil 9/9
+    # (IMG_6497) resp. hmm_flip_prob 5/5 (testovaci_1) – kombinace pokrývá oba
+    # případy bez nutnosti vědět předem, který detektor bude na dané scéně lepší.
     for row in frame_rows:
-        row["flip_window"] = bool(row["hmm_flip"])
+        row["combined_flip_prob"] = max(row["hmm_flip_prob"], row.get("cov_flip_prob", 0.0))
+
+    # ── Post-processing: flip_window – zpětné označení snímků rotace ─────────
+    # combined_flip_prob se aktivuje až po nahromadění dostatečné rotace, takže
+    # samotný náběh (prvních pár desítek stupňů rotace) mu unikne – proto se
+    # vzestupná hrana zpětně promítne na FLIP_BACKFILL_FRAMES předchozích snímků.
+    # Celé plató (ne jen náběh) se počítá taky – proti dopřednému "doznívání" do
+    # snímků bez platné pózy (osoba mimo záběr při dopadu) chrání už samotné
+    # is_jump, které je v takových snímcích napevno False.
+    FLIP_BACKFILL_FRAMES = 4
+    COMBINED_FLIP_THR = 0.85
+    for row in frame_rows:
+        row["_combined_flip"] = row["combined_flip_prob"] > COMBINED_FLIP_THR
+    for row in frame_rows:
+        row["flip_window"] = bool(row["_combined_flip"])
     for i, row in enumerate(frame_rows):
-        prev_flip = frame_rows[i - 1]["hmm_flip"] if i > 0 else False
-        if row["hmm_flip"] and not prev_flip:
+        prev_flip = frame_rows[i - 1]["_combined_flip"] if i > 0 else False
+        if row["_combined_flip"] and not prev_flip:
             for j in range(max(0, i - FLIP_BACKFILL_FRAMES), i + 1):
                 frame_rows[j]["flip_window"] = True
 
@@ -651,7 +665,7 @@ def process_video(
     # skok   = proběhl skok, ale BEZ (jisté, 0.85) otočky
     ACROBE_PROB_THR = 0.6
     for row in frame_rows:
-        row["_flip_lo"] = row.get("hmm_flip_prob", 0.0) >= ACROBE_PROB_THR
+        row["_flip_lo"] = row["combined_flip_prob"] >= ACROBE_PROB_THR
     for row in frame_rows:
         row["flip_window_lo"] = bool(row["_flip_lo"])
     for i, row in enumerate(frame_rows):
@@ -667,7 +681,7 @@ def process_video(
     # Zápis do CSV
     with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
         w = csv.writer(csv_file)
-        w.writerow(["timestamp_ms", "debug_ms", "highlight", "is_jump", "freerun", "hmm_flip", "hmm_flip_prob", "flip_window", "cov_flip_prob", "backup", "action"])
+        w.writerow(["timestamp_ms", "debug_ms", "highlight", "is_jump", "freerun", "hmm_flip", "hmm_flip_prob", "flip_window", "cov_flip_prob", "combined_flip_prob", "backup", "action"])
         for row in frame_rows:
             w.writerow([
                 row["timestamp_ms"],
@@ -679,6 +693,7 @@ def process_video(
                 row.get("hmm_flip_prob", 0.0),
                 str(row.get("flip_window", False)),
                 row.get("cov_flip_prob", 0.0),
+                round(row["combined_flip_prob"], 3),
                 str(row["backup"]),
                 row["action"],
             ])
