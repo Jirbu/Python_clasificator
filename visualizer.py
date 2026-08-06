@@ -379,14 +379,23 @@ class Visualizer:
 
         # ── Skeleton ─────────────────────────────────────────────────────
         # landmarks = validní pipeline success; raw_lm = cokoliv co MediaPipe detekoval
-        scale_switch = result.get("scale_switch", False)
-        draw_lm = landmarks if landmarks is not None else raw_lm
+        scale_switch     = result.get("scale_switch", False)
+        reacquire_reject = result.get("reacquire_reject", False)
+        viz_reject_lm    = result.get("_viz_reject_lm")
+        draw_lm = landmarks if landmarks is not None else (
+            viz_reject_lm if reacquire_reject else raw_lm
+        )
         pipeline_ok = landmarks is not None
         if draw_lm is not None:
             if is_p1:
+                # Červená = scale_switch (přeskok detekovaný přes skokovou změnu
+                # velikosti), fialová = reacquire_reject (přeskok při návratu
+                # z GHOST/LOST kvůli neshodě barvy) – viz changes_lockin.md.
+                _reject_color = (200, 0, 140) if reacquire_reject else (0, 0, 220)
                 self._draw_skeleton_p1(frame, draw_lm,
                                        dimmed=(not pipeline_ok and valid_pose and not scale_switch),
-                                       invalid=(not valid_pose))
+                                       invalid=(not valid_pose),
+                                       reject_color=_reject_color)
             else:
                 self._draw_skeleton_p2(frame, draw_lm)
 
@@ -457,9 +466,12 @@ class Visualizer:
         landmarks: np.ndarray,
         dimmed: bool = False,
         invalid: bool = False,
+        reject_color: tuple[int, int, int] = (0, 0, 220),
     ) -> None:
         """Skelet P1: barevný (zelená/oranžová/šedá) nebo ztlumený při pipeline FAIL.
-        invalid=True: celá pose červene – pose existuje ale byla odmítnuta validací."""
+        invalid=True: celá pose barvou reject_color – pose existuje, ale byla
+        odmítnuta validací (červená = scale_switch, fialová = reacquire_reject,
+        viz volající kód)."""
         h, w = frame.shape[:2]
         pts = [(int(lm[0] * w), int(lm[1] * h), float(lm[3])) for lm in landmarks]
 
@@ -467,7 +479,7 @@ class Visualizer:
             if pts[si][2] < 0.3 or pts[ei][2] < 0.3:
                 continue
             if invalid:
-                color = (0, 0, 220)
+                color = reject_color
             elif dimmed:
                 color = (80, 80, 80)
             elif si in _LEFT_IDX and ei in _LEFT_IDX:
@@ -478,7 +490,7 @@ class Visualizer:
                 color = _P1_CENTER
             cv2.line(frame, pts[si][:2], pts[ei][:2], color, 2, cv2.LINE_AA)
 
-        pt_color = (0, 0, 200) if invalid else ((120, 120, 120) if dimmed else _P1_PT)
+        pt_color = reject_color if invalid else ((120, 120, 120) if dimmed else _P1_PT)
         for px, py, vis in pts:
             if vis < 0.3:
                 continue
@@ -490,7 +502,7 @@ class Visualizer:
         if torso_pts:
             tx = int(sum(p[0] for p in torso_pts) / len(torso_pts))
             ty = int(sum(p[1] for p in torso_pts) / len(torso_pts))
-            lc = (0, 0, 200) if invalid else ((80, 80, 80) if dimmed else _P1_BOX)
+            lc = reject_color if invalid else ((80, 80, 80) if dimmed else _P1_BOX)
             _text_bg(frame, "P1", tx - 10, ty, _FONT_MD, lc, thick=2)
 
     def _draw_skeleton_p2(self, frame: np.ndarray, landmarks: np.ndarray) -> None:

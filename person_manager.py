@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 # ── Konstanty ──────────────────────────────────────────────────────────────────
 # Crop
 _CROP_MARGIN       = 0.40   # margin okolo bbox při výpočtu crop
+# Pozn.: dynamický (rychlostí modulovaný) crop margin byl vyzkoušen a zavržen
+# – viz changes_lockin.md. Způsoboval regrese na blízkých scénách.
 _MIN_CROP_PX       = 30     # min rozměr crop oblasti [px]
 
 # Stavový automat
@@ -130,6 +132,12 @@ _FINAL_THR    = 0.30   # min final_conf pro pipeline SUCCESS
 # scale_change_detector – detekce přeskoku na jinou osobu
 _SCALE_SWITCH_THR      = 0.45   # min scale_err pro detekci přeskoku
 _SCALE_SWITCH_APPEAR   = 0.80   # max appearance_score při přeskoku (nízká = jiná osoba)
+
+# Tvrdé zamítnutí při znovuzískání po GHOST/LOST, pokud barva neodpovídá
+# historii – viz changes_lockin.md. Netýká se běžného průběžného trackingu
+# (tam appearance zůstává jen měkkou složkou final_conf), jen konkrétně
+# momentu návratu z výpadku, kde je riziko přeskoku na jinou osobu nejvyšší.
+_REACQUIRE_APPEAR_MIN  = 0.45
 
 # overlap check – zamítnutí P2 pokud se překrývá s P1
 _OVERLAP_SAME_PERSON_THR = 0.50  # průměrné překrytí bbox nad tímto prahem → stejná osoba
@@ -548,7 +556,7 @@ class PersonManager:
             # hires (512×288) jako výchozí rozlišení pro crop detekci místo
             # standardu (256×144) – změřeno: méně L2 eskalací, méně "bez pózy",
             # i celkově rychlejší (méně nutných backup pokusů jinde ve videu).
-            lm_crop = self._detect_in_crop_hires(frame, crop, image_detector)
+            lm_crop = self._detect_in_crop_hires(frame, crop, image_detector, slot)
             crop_ok, lm_c, kin_c, c_stage, c_val, c_ref = self._early_filter(
                 slot, lm_crop, relaxed_kin=is_relaxed
             )
@@ -628,7 +636,7 @@ class PersonManager:
                 "Slot 0: suspicious (pose_param=%.3f) – backup L1 normální rozlišení na %s",
                 result.get("pose_param", 0.0), fb_label,
             )
-            lm_l1 = self._detect_in_crop(fb_frame, fb_crop, image_detector)
+            lm_l1 = self._detect_in_crop(fb_frame, fb_crop, image_detector, slot)
             if lm_l1 is not None:
                 l1_ok, lm_l1v, kin_l1, _, _, _ = self._early_filter(
                     slot, lm_l1, relaxed_kin=is_relaxed_fb
@@ -642,7 +650,7 @@ class PersonManager:
             # Level 2: hires rozlišení – pouze pokud L1 selhal
             if backup_level == 9:
                 logger.info("Slot 0: L1 selhal – zkouším backup L2 hires (512×288) na %s", fb_label)
-                lm_l2 = self._detect_in_crop_hires(fb_frame, fb_crop, image_detector)
+                lm_l2 = self._detect_in_crop_hires(fb_frame, fb_crop, image_detector, slot)
                 if lm_l2 is not None:
                     l2_ok, lm_l2v, kin_l2, _, _, _ = self._early_filter(
                         slot, lm_l2, relaxed_kin=is_relaxed_fb
@@ -696,7 +704,7 @@ class PersonManager:
         crop = slot.crop if slot.state != slot.LOST else slot.frozen_crop
         detection_crop = crop   # crop použitý pro detekci v TOMTO snímku
         is_relaxed = slot.state in (slot.GHOST, slot.LOST)
-        lm_crop = self._detect_in_crop(frame, crop, image_detector)
+        lm_crop = self._detect_in_crop(frame, crop, image_detector, slot)
         full_ok, lm_v, kin_v, _, _, _ = self._early_filter(slot, lm_crop, relaxed_kin=is_relaxed)
         effective_lm = lm_v  if full_ok else None
         kin_score    = kin_v if full_ok else 0.0
@@ -735,7 +743,7 @@ class PersonManager:
                 "Slot 1: snímek suspicious (pose_param=%.3f) – spouštím hires fallback (512×288)",
                 result.get("pose_param", 0.0),
             )
-            lm_hires = self._detect_in_crop_hires(frame, hires_crop, image_detector)
+            lm_hires = self._detect_in_crop_hires(frame, hires_crop, image_detector, slot)
             if lm_hires is not None:
                 is_relaxed_hires = slot.state in (slot.GHOST, slot.LOST)
                 hires_ok, lm_h, kin_h, _, _, _ = self._early_filter(
@@ -836,6 +844,30 @@ class PersonManager:
         # 6. Appearance validator (soft)
         appearance_score = slot.appearance_validator.update(frame, effective_lm)
 
+        # 6a. Tvrdé zamítnutí při návratu z GHOST/LOST, pokud barva neodpovídá
+        # historii – viz changes_lockin.md. Během GHOST/LOST hledá pipeline
+        # kandidáta ve (frozen_)crop okolí poslední známé pozice; v davu se tam
+        # může připlést jiná osoba a bez tohohle gate by ji propustila (appearance
+        # je jinak jen měkká 25% složka final_conf, snadno přebitá trackerem/kin/
+        # motion). Netýká se běžného průběžného trackingu (žádný gap).
+        reacquire_reject = False
+        if (
+            valid_pose
+            and slot.state in (slot.GHOST, slot.LOST)
+            and slot.appearance_validator.has_history
+            and appearance_score < _REACQUIRE_APPEAR_MIN
+        ):
+            reacquire_reject = True
+            logger.info(
+                "Slot %d: reacquire zamítnuto – barva neodpovídá historii (appear=%.3f < %.3f)",
+                slot.slot_id, appearance_score, _REACQUIRE_APPEAR_MIN,
+            )
+            valid_pose            = False
+            _reacquire_reject_lm  = effective_lm   # uchováme pro vizualizaci (fialově)
+            effective_lm          = None
+        else:
+            _reacquire_reject_lm  = None
+
         # 6b. Pose consistency (suspicious flag)
         suspicious, pose_param_score = slot.consistency_validator.update(
             effective_lm if valid_pose else None
@@ -930,8 +962,14 @@ class PersonManager:
             "person_present":   person_present,
             "valid_pose":       valid_pose,
             "landmarks":        effective_lm if pipeline_success else None,
+            # POZOR: _raw_lm se používá i pro výpočet (torso_angle, bbox_frac
+            # v main.py), ne jen pro vizualizaci – proto při reacquire_reject
+            # (na rozdíl od _viz_reject_lm níže) NESMÍ obsahovat zamítnutou
+            # (možná cizí) pózu, jinak by se její data propsala do flip signálu.
             "_raw_lm":          _scale_switch_lm if scale_switch else effective_lm,
+            "_viz_reject_lm":   _reacquire_reject_lm,  # jen pro vizualizaci (fialově)
             "scale_switch":     scale_switch,
+            "reacquire_reject": reacquire_reject,
             "final_conf":       round(final_conf, 3),
             "presence_prob":    round(presence_prob, 3),
             "sim_score":        round(sim_score, 3),
@@ -951,7 +989,6 @@ class PersonManager:
             "pose_ang_score":   round(slot.consistency_validator.last_ang_score, 3),
             "pose_scale_err":   round(slot.scale_detector.last_scale_err, 3),
             "pose_scale_detail": slot.scale_detector.last_scale_detail,
-            "scale_switch":     scale_switch,
         }
 
     # ── State machine ─────────────────────────────────────────────────────────
@@ -997,8 +1034,8 @@ class PersonManager:
                         and slot.crop_side_ema is not None
                         and raw_side > slot.crop_side_ema
                     ):
-                        slot.crop_side_ema = None
-                        slot.crop_side_max = None
+                        slot.crop_side_ema     = None
+                        slot.crop_side_max     = None
 
                     if slot.crop_side_ema is None:
                         slot.crop_side_ema = raw_side * (1.0 + _CROP_MARGIN)
@@ -1009,6 +1046,13 @@ class PersonManager:
                         )
                     if slot.crop_side_max is None or slot.crop_side_ema > slot.crop_side_max:
                         slot.crop_side_max = slot.crop_side_ema
+
+                    # Dynamický margin podle rychlosti byl vyzkoušen a ZAVRŽEN –
+                    # viz changes_lockin.md ("Zjištěno po nasazení"). Způsobil
+                    # regrese na testovaci_1/4/5 (crop se zvětšuje s 1snímkovým
+                    # zpožděním za rychlostí, takže při náhlém zrychlení dočasně
+                    # ořízne postavu přesně v kritické fázi). IMG_6497 zůstal
+                    # nedotčen (9/9), ale čistý efekt napříč videi byl negativní.
                     effective_side = max(raw_side, slot.crop_side_ema)
                 else:
                     effective_side = slot.crop_side_ema
@@ -1159,11 +1203,34 @@ class PersonManager:
 
     # ── Utility ───────────────────────────────────────────────────────────────
 
+    def _pick_crop_candidate(
+        self,
+        detected: list,
+        crop: tuple,
+        slot: PersonSlot | None,
+    ) -> np.ndarray | None:
+        """
+        Z kandidátů vrácených detektorem PRO JEDEN crop vybere toho, který
+        odpovídá sledované osobě – ne slepě prvního v pořadí. `detect_all`
+        (num_poses=2 pro MediaPipe) může vrátit i 2 lidi, pokud se do cropu
+        vejdou oba (viz changes_lockin.md); bez tohohle výběru by se mohl
+        propustit kdokoliv, kdo v modelu vyjde jako první.
+
+        Při jediném kandidátovi (běžný případ) se chování NEMĚNÍ – žádná
+        pozicová kontrola, žádné riziko regrese.
+        """
+        candidates_full = [_crop_to_fullframe(lm, crop) for lm in detected]
+        if len(candidates_full) == 1 or slot is None:
+            return candidates_full[0]
+        best = self._nearest_to(candidates_full, slot)
+        return best if best is not None else candidates_full[0]
+
     def _detect_in_crop(
         self,
         frame: np.ndarray,
         crop: tuple | None,
         image_detector,
+        slot: PersonSlot | None = None,
     ) -> np.ndarray | None:
         """Detekuje pózu v crop oblasti, přepočítá na full-frame souřadnice."""
         if crop is None:
@@ -1174,13 +1241,14 @@ class PersonManager:
         detected = image_detector.detect_all(crop_px)
         if not detected:
             return None
-        return _crop_to_fullframe(detected[0], crop)
+        return self._pick_crop_candidate(detected, crop, slot)
 
     def _detect_in_crop_hires(
         self,
         frame: np.ndarray,
         crop: tuple | None,
         image_detector,
+        slot: PersonSlot | None = None,
     ) -> np.ndarray | None:
         """Stejné jako _detect_in_crop, ale používá detect_all_hires (512×288)."""
         if crop is None:
@@ -1191,7 +1259,7 @@ class PersonManager:
         detected = image_detector.detect_all_hires(crop_px)
         if not detected:
             return None
-        return _crop_to_fullframe(detected[0], crop)
+        return self._pick_crop_candidate(detected, crop, slot)
 
     def _nearest_to(
         self,

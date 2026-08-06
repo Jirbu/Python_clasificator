@@ -60,3 +60,32 @@ Formát:
   landmarků – takže nejde o čistě "YOLOv8 vs MediaPipe" jev, spíš tenhle práh byl asi
   vždy moc přísný na rychlou akrobacii při 8fps vzorkování a jen se to dřív neprojevilo
   (tyhle snímky dřív padaly už na dřívějších (geometrických) vrstvách).
+
+### pose_backends.py: `YoloPoseBackend` – `min_confidence` se vůbec nepoužíval (bug, ne threshold retuning)
+- Původní (MediaPipe) hodnota: n/a – u MediaPipe `min_confidence` VŽDY fungoval
+  (`PoseDetectorImage(min_confidence=min_confidence)`), YOLO cesta ho ale
+  nikdy nedostala. `YoloPoseBackend.__init__` parametr `min_confidence`
+  vůbec neměl, `self._model(frame, verbose=False)` bez `conf=` – ultralytics
+  tak detekoval s vlastním výchozím prahem (~0.25), ne s naším 0.5.
+- Nová hodnota: `YoloPoseBackend.__init__(..., min_confidence=0.5)`, volání
+  `self._model(frame, conf=self._min_confidence, verbose=False)`. Factory
+  (`create_pose_detectors`) záměrně NEPŘEDÁVÁ generické `min_confidence` do
+  `YoloPoseBackend()` – má svůj vlastní default (teď stejná hodnota, 0.5,
+  ale koncepčně nezávislý, viz per-model vzor jinde v `person_manager.py`).
+- Vyzkoušeno a zavrženo (2026-08-05): `min_confidence=0.15`. Hypotéza byla,
+  že 0.5 zahazuje reálné (jen nejisté) detekce, hlavně v davu (`testovaci_5`/
+  `IMG_7630`, kde je v záběru opravdu hodně lidí – ne šum, jak jsem si
+  původně myslel). Otestováno na všech 4 referenčních videích:
+
+  | Video | 0.5 | 0.15 |
+  |---|---|---|
+  | IMG_6497 | 8/9 HIGHLIGHTS (+1 přes ACROBE = fakticky 9/9) | 9/9 HIGHLIGHTS, ale +2 nové false positive |
+  | testovaci_1 | 5/5, 0 FP | 3/5 (regrese) |
+  | testovaci_4 | 9 clusterů | 7 clusterů (regrese) |
+  | testovaci_5 | 1/4 čistě | 1/4 čistě – BEZE ZMĚNY |
+
+  0.15 pomohlo jen `IMG_6497` (a i tam s cenou FP), zhoršilo dvě další videa,
+  a hlavní cíl (opravit `testovaci_5`) vůbec nesplnilo – potvrzuje, že zbylé
+  problémy na `testovaci_5` (ref1/ref2/ref4 chybí) NEJSOU způsobené touhle
+  hodnotou, mají jinou příčinu (zatím nediagnostikováno). Vráceno na 0.5
+  jako empiricky nejlepší kompromis ze všech testovaných hodnot.

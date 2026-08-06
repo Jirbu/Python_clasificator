@@ -155,13 +155,20 @@ _YOLO_WEAK_BOX_CONF_THR = 0.7   # pod tímto prahem box confidence (jistota "je 
 class YoloPoseBackend:
     """Stejné rozhraní jako MoveNetBackend, přes ultralytics YOLOv8-pose."""
 
-    def __init__(self, weights: str = "yolov8n-pose.pt"):
+    def __init__(self, weights: str = "yolov8n-pose.pt", min_confidence: float = 0.5):
         from ultralytics import YOLO
         self._model = YOLO(weights)
+        # Vyzkoušeno 0.5 / 0.15 / 0.3 na 4 referenčních videích (viz
+        # changes_to_yolo.md) – 0.5 vyšlo empiricky nejlépe napříč všemi:
+        # 0.15 zlepšilo jen IMG_6497 (a i tam za cenu 2 nových false positive),
+        # ale zhoršilo testovaci_1 (5/5→3/5) a testovaci_4 (9→7 clusterů),
+        # a testovaci_5 nezměnilo vůbec. Zbylé problémy na testovaci_5 (ref1/
+        # ref2/ref4 chybí) NEJSOU způsobené touhle hodnotou – jiná příčina.
+        self._min_confidence = min_confidence
 
     def _run_all_raw(self, frame: np.ndarray) -> tuple[list[np.ndarray], float | None]:
         """Detekce bez rotace. Vrátí (landmarks všech osob, box confidence první/top osoby)."""
-        results = self._model(frame, verbose=False)
+        results = self._model(frame, conf=self._min_confidence, verbose=False)
         if not results or results[0].keypoints is None or results[0].boxes is None:
             return [], None
         kp = results[0].keypoints
@@ -248,6 +255,9 @@ def create_pose_detectors(
         return backend, backend
 
     if POSE_MODEL == "yolov8":
+        # Nepředává se sem generické min_confidence (0.5, vyladěné pro
+        # MediaPipe) – YoloPoseBackend má vlastní, záměrně nízký výchozí
+        # práh (0.15), viz komentář v jeho __init__ a changes_to_yolo.md.
         backend = YoloPoseBackend()
         return backend, backend
 
